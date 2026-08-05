@@ -328,6 +328,21 @@ class TestCheckMode(unittest.TestCase):
         ss.assert_not_called()   # nothing applied
         rs.assert_not_called()   # no reboot
 
+    def test_sigint_during_check_makes_no_changes(self):
+        # Ctrl+C during a --check must exit without PATCHing/rebooting the device.
+        saved = (b.check_mode, b.handling_interrupt, b.system_reset_done)
+        b.check_mode = True
+        b.handling_interrupt = False
+        b.system_reset_done = False
+        try:
+            with mock.patch.object(b, "set_system_settings") as ss:
+                with self.assertRaises(SystemExit) as cm:
+                    b.handle_sigint(2, None)
+            ss.assert_not_called()
+            self.assertEqual(cm.exception.code, 0)
+        finally:
+            (b.check_mode, b.handling_interrupt, b.system_reset_done) = saved
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -88,11 +88,11 @@ Optional parameters:
 - `--benchmark-time <s>`: override the per-combo window in seconds (default: 600)
 - `--voltage-step <mV>` / `--frequency-step <MHz>`: sweep increments (defaults: 20 / 25)
 - `--dry-run`: print the resolved plan and exit without touching the device
-- `--check`: read-only — measure the current setting once (no changes, no reboot) and report
+- `--check`: read-only — measure the current setting once (no changes, no reboot) and report. Uses a shorter ~240s window unless `--benchmark-time` is given.
 
-Quick health check (no changes to the miner):
+Quick health check (no changes to the miner). On a Gamma that idles near 66–67 °C, pass `--max-temp 68` so the check isn't cut short by the temperature cutoff:
 ```bash
-python bitaxe_hashrate_benchmark.py 192.168.2.29 --check
+python bitaxe_hashrate_benchmark.py 192.168.2.29 --check --max-temp 68
 ```
 
 Trim a healthy miner for efficiency (hold frequency, lower voltage while it still passes):

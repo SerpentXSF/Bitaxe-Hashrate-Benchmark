@@ -60,6 +60,7 @@ THERMAL_REASONS = ("CHIP_TEMP_EXCEEDED", "VR_TEMP_EXCEEDED", "POWER_CONSUMPTION_
 # State flags
 handling_interrupt = False
 system_reset_done = False
+check_mode = False            # read-only --check run: never mutate the device
 
 
 def parse_arguments():
@@ -80,7 +81,8 @@ def parse_arguments():
     parser.add_argument('--dry-run', action='store_true',
                         help='Print the resolved plan and exit without touching the device')
     parser.add_argument('--check', action='store_true',
-                        help='Read-only: measure the current setting once (no changes, no reboot) and report')
+                        help='Read-only: measure the current setting once (no changes, no reboot) and '
+                             'report; uses a shorter ~240s window unless --benchmark-time is given')
     parser.add_argument('--max-error', type=float, default=3.5,
                         help='Error-rate ceiling in percent for selecting the best setting (default: 3.5)')
     parser.add_argument('--max-temp', type=int, default=66,
@@ -274,6 +276,11 @@ def handle_sigint(signum, frame):
 
     if handling_interrupt or system_reset_done:
         return
+
+    # A --check run never changed anything, so exit without touching the device.
+    if check_mode:
+        print(RED + "\nHealth check interrupted; no changes made." + RESET)
+        sys.exit(0)
 
     handling_interrupt = True
     print(RED + "Benchmarking interrupted by user." + RESET)
@@ -813,8 +820,7 @@ def run_grid():
 
     while current_voltage <= max_allowed_voltage and current_frequency <= max_allowed_frequency:
         if resume_enabled and already_tested(current_voltage, current_frequency):
-            rec = next((r for r in results if r["coreVoltage"] == current_voltage
-                        and r["frequency"] == current_frequency), None)
+            rec = _recorded(current_voltage, current_frequency)
             print(YELLOW + f"Resume: skipping already-tested {current_voltage}mV / {current_frequency}MHz" + RESET)
             # Replay the same branch the live run would have taken from this combo.
             if rec is not None and not combo_passes(rec):
@@ -1000,16 +1006,18 @@ def run_check():
     r = benchmark_iteration(voltage, frequency)
     if not r["ok"]:
         print(RED + f"Check could not complete ({r['reason']})." + RESET)
-        return
+        return False
     er = f"{r['errorRate']:.2f}%" if r["errorRate"] is not None else "n/a"
     gate = ("PASS" if passes_error_gate(r["errorRate"], max_error_rate) else "OVER CEILING") \
         if r["errorRate"] is not None else "no error data"
     vr = f"   VR: {r['averageVRTemp']:.1f}°C" if r["averageVRTemp"] is not None else ""
-    print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz\n"
+    partial = "   (partial window — error cut it short)" if r["earlyAborted"] else ""
+    print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz{partial}\n"
                   f"  Hashrate:   {r['averageHashRate']:.1f} GH/s\n"
                   f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
                   f"  Error:      {er} [{gate} @ {max_error_rate:.1f}%]\n"
                   f"  Temp:       {r['averageTemperature']:.1f}°C{vr}" + RESET)
+    return True
 
 
 def print_run_expectations():
@@ -1033,13 +1041,14 @@ def print_run_expectations():
 def main():
     global bitaxe_ip, initial_voltage, initial_frequency, benchmark_time
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
-    global max_temp, system_reset_done, voltage_increment, frequency_increment
+    global max_temp, system_reset_done, voltage_increment, frequency_increment, check_mode
 
     args = parse_arguments()
     if not args.bitaxe_ip:
         print(RED + "Error: Bitaxe IP address is required." + RESET)
         sys.exit(1)
 
+    check_mode = args.check
     bitaxe_ip = f"http://{args.bitaxe_ip}"
     max_error_rate = args.max_error
     max_temp = args.max_temp
@@ -1070,7 +1079,8 @@ def main():
 
     # Read-only health check: measure the current setting and exit, no sweep.
     if args.check:
-        run_check()
+        if not run_check():
+            sys.exit(1)
         return
 
     # Resolve start voltage/frequency. Grid keeps the upstream 1150/500 start;
