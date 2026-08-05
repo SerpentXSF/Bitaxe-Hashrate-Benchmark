@@ -8,7 +8,7 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 
 - **Error-rate measurement** — the mean `errorPercentage` over each combo's stable window, plus the raw ASIC error count accrued (`errorCountDelta`).
 - **Error gate → efficiency selection** — the "best" setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%), instead of the raw fastest. Falls back to the lowest-error setting when nothing clears the ceiling.
-- **`refine` mode** — holds frequency fixed and sweeps voltage only, stopping at the lowest voltage that clears the error ceiling. Minutes instead of hours; ideal for rescuing a single unstable ASIC.
+- **`refine` mode** — a fast single-ASIC rescue path. Sweeps voltage upward to the lowest setting that clears the error ceiling, then probes *downward* for a leaner (better J/TH) passer. If the chip is thermally boxed in — error still too high when the temperature ceiling is reached — it automatically drops the frequency and retries, since frequency, not voltage, is the lever at that point. Combos that clearly can't clear the ceiling are aborted early to save time.
 - **Configurable chip-temp ceiling** (`--max-temp`) — BM1370/Gamma boards often idle near 65 °C and need 68 to have room to raise voltage.
 - **CSV export and a ranked summary table** (highest hashrate / most efficient / lowest error) alongside the existing JSON.
 - **Resume** (`--resume`) — reload prior results for an IP and skip already-tested combinations.

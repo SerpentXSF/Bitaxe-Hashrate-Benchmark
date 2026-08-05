@@ -60,11 +60,19 @@ uses the mean-percentage metric.
 - `--mode grid` (default): the existing full sweep, now error-aware. A combo
   that fails the gate is treated like an unstable result (raise voltage / step
   back frequency) instead of climbing.
-- `--mode refine`: hold frequency fixed (device current, or `-f`) and sweep
-  **voltage only** upward from the current/`-v` value. Stop at the **first
-  voltage that passes the gate with in-tolerance hashrate** — the lowest passing
-  voltage is the most efficient low-error point at that frequency. Minutes, not
-  hours; this is the single-ASIC rescue path.
+- `--mode refine`: the single-ASIC rescue path. Start at the device's current
+  (or `-v`/`-f`) setting and sweep **voltage upward** to the first setting that
+  passes the gate with in-tolerance hashrate, then probe **downward** for a
+  leaner (lower J/TH) passer. If the frequency is **thermally boxed in** — the
+  temperature ceiling is hit before the error clears — automatically **drop the
+  frequency** by one increment and retry, because frequency (not voltage) is the
+  lever once cooling is the limit. Combos whose best-case mean can no longer
+  reach the ceiling are aborted early. Minutes, not hours.
+
+  (Field note: on real BM1370 Gammas, both troubled miners and the 1.5 Ths
+  overclock unit turned out to be thermally boxed in at their aggressive clocks —
+  error fell monotonically with voltage but hit the temp ceiling first. The
+  frequency-drop behavior exists so refine handles that case on its own.)
 
 ### Output
 
