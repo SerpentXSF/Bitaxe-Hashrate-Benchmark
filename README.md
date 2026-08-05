@@ -123,6 +123,25 @@ Example:
 docker run --rm bitaxe-benchmark 192.168.2.26 -v 1200 -f 550
 ```
 
+## Benchmarking process
+
+Every combination runs the same measured cycle:
+
+1. **Apply & verify** — set the voltage/frequency, reboot, wait 90s to stabilize, then read the settings back to confirm the device actually took them (a failed apply or watchdog reboot won't mislabel a result).
+2. **Measure** — sample every 15s over the window (default 10 min). Transient post-reboot readings (sensors not ready yet) are skipped rather than aborting the combo.
+3. **Reduce** — average hashrate (dropping 3 high + 3 low outliers), temperature, VR temperature and power (excluding the warmup samples), compute J/TH, and derive the error rate as a trimmed mean of `errorPercentage` over the stable window. A combo that clearly can't reach the error ceiling is aborted early but still recorded as a fallback floor.
+4. **Decide the next combo** (per mode, below).
+5. **Select & apply** — once the sweep ends, pick the **most efficient (lowest J/TH) setting that stayed under the error ceiling with in-tolerance hashrate**; if nothing qualifies, fall back to the lowest-error setting. Apply it, save JSON + CSV, and print the ranked summary.
+
+How step 4 differs by mode:
+
+- **grid** — start conservative (default 1150mV / 500MHz) and climb: if the combo is stable and under the ceiling, raise frequency; if it's unstable, over the ceiling, or thermally capped, step frequency back and raise voltage. Stops at the voltage/frequency limits.
+- **refine** — hold the frequency and sweep voltage **up** to the first setting that clears the ceiling, then probe **down** for a leaner one. If the chip hits the temperature ceiling before the error clears, drop the frequency and retry (frequency is the lever once cooling is the limit).
+- **efficiency** — hold the frequency and sweep voltage **down** from the current setting to the leanest voltage that still clears the ceiling.
+- **--check** — measure the current setting once and report; no changes, no reboot.
+
+The miner reboots between combos and mining is interrupted for the whole run; the tool restores the best setting it found (or your original) on exit and on Ctrl+C. The final restore skips the 90s stabilization wait.
+
 ## Configuration
 
 The script includes several configurable parameters:
