@@ -54,7 +54,7 @@ default_frequency = None
 results = []
 results_basename_override = None   # set by --resume to keep writing the same file
 
-# Abort reasons that mean "too hot / too much power" — the lever is frequency, not voltage
+# Abort reasons that mean "too hot / too much power": lower frequency, don't add voltage
 THERMAL_REASONS = ("CHIP_TEMP_EXCEEDED", "VR_TEMP_EXCEEDED", "POWER_CONSUMPTION_EXCEEDED")
 
 # State flags
@@ -103,7 +103,7 @@ def parse_arguments():
 
 
 # --------------------------------------------------------------------------- #
-# Pure helpers (no globals, no I/O) — unit-tested in tests/                    #
+# Pure helpers (no globals, no I/O) - unit-tested in tests/                    #
 # --------------------------------------------------------------------------- #
 
 def sum_error_count(info):
@@ -130,11 +130,11 @@ def compute_window_error(samples):
     """ASIC error rate (percent) over a combo's post-warmup samples.
 
     The device's `errorPercentage` is a noisy rolling rate (not a cumulative
-    ratio), so we average it across the stable window — the faithful metric that
-    matches what AxeOS reports. With enough samples we drop one extreme at each
-    end (a light trimmed mean) so a single spike can't tip a borderline combo
-    across the ceiling. Each sample is a dict with 'error_percentage'
-    (float|None). Returns (rate_or_None, method_string)."""
+    ratio), so we average it across the stable window, which matches what AxeOS
+    reports. With enough samples we drop one extreme at each end (a light trimmed
+    mean) so a single spike can't push a borderline combo over the ceiling. Each
+    sample is a dict with 'error_percentage' (float|None). Returns
+    (rate_or_None, method_string)."""
     eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
     if not eps:
         return (None, 'unavailable')
@@ -203,7 +203,7 @@ def select_best(all_results, ceiling, gate_enabled=True):
     if passers:
         return sorted(passers, key=lambda r: (r['efficiencyJTH'], -r['averageHashRate']))[0]
 
-    # Nothing passed — prefer in-tolerance and full-window data, then lowest
+    # Nothing passed - prefer in-tolerance and full-window data, then lowest
     # error, then efficiency. (Early-aborted combos are partial-window floors.)
     def err_key(r):
         er = r.get('errorRate')
@@ -220,9 +220,9 @@ def select_best(all_results, ceiling, gate_enabled=True):
 def fetch_default_settings():
     """Read the device's CURRENT voltage/frequency (the refine start point and the
     restore-on-exit baseline) plus core/ASIC counts. Current settings come from
-    /api/system/info; only genuinely missing pieces are backfilled from
+    /api/system/info; only missing pieces are backfilled from
     /api/system/asic (whose defaultVoltage/defaultFrequency are STOCK values, not
-    the running ones — so they must never overwrite present current settings)."""
+    the running ones - so they must never overwrite present current settings)."""
     global default_voltage, default_frequency, small_core_count, asic_count
 
     try:
@@ -335,7 +335,7 @@ def set_system_settings(core_voltage, frequency, skip_wait=False):
 def restart_system(skip_wait=False):
     try:
         # Wait for stabilization before benchmarking, but not on an interrupt or a
-        # final restore (skip_wait) — nothing is measured after those, so the 90 s
+        # final restore (skip_wait) - nothing is measured after those, so the 90 s
         # sleep would just delay exit.
         if handling_interrupt or skip_wait:
             print(YELLOW + "Applying final settings..." + RESET)
@@ -401,7 +401,7 @@ def _warn_no_error_data():
     """One-time prominent notice that the gate is inert on this device."""
     global _no_error_data_warned
     if not _no_error_data_warned:
-        print(YELLOW + "Note: this device exposes no error-rate data — the error gate is inert "
+        print(YELLOW + "Note: this device exposes no error-rate data - the error gate is inert "
                        "and best-setting selection falls back to pure J/TH." + RESET)
         _no_error_data_warned = True
 
@@ -409,7 +409,7 @@ def _warn_no_error_data():
 def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
                      error_samples, expected_hashrate, early=False):
     """Turn a window's collected samples into a result dict. Called both at
-    end-of-window and on an early abort — so a marginal device that never clears
+    end-of-window and on an early abort - so a marginal device that never clears
     the ceiling still leaves a recorded (partial) floor for select_best."""
     if not (hash_rates and temperatures and power_consumptions):
         print(YELLOW + "No Hashrate or Temperature or Watts data collected." + RESET)
@@ -421,7 +421,7 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     average_hashrate = sum(trimmed_hashrates) / len(trimmed_hashrates)
 
     # Temp/VR/power: drop the warmup samples chronologically (the first N), not by
-    # value — clipping the lowest readings anywhere would bias the average high.
+    # value - clipping the lowest readings anywhere would bias the average high.
     chron_temps = temperatures[warmup_samples:] if len(temperatures) > warmup_samples else temperatures
     average_temperature = sum(chron_temps) / len(chron_temps)
 
@@ -648,7 +648,7 @@ def load_existing_results():
     prior = data.get("all_results", data) if isinstance(data, dict) else data
     if isinstance(prior, list):
         results = prior
-        results_basename_override = latest[:-5]  # strip '.json' — keep writing this file
+        results_basename_override = latest[:-5]  # strip '.json' - keep writing this file
         print(GREEN + f"Resume: loaded {len(results)} prior result(s) from {latest}" + RESET)
 
 
@@ -875,14 +875,14 @@ def _refine_probe_down(frequency, start_voltage):
         if resume_enabled and already_tested(voltage, frequency):
             rec = _recorded(voltage, frequency)
             if rec is not None and not combo_passes(rec):
-                return  # known failure here — the lowest passer is above this
+                return  # known failure here - the lowest passer is above this
             voltage -= voltage_increment
             continue
         res, reason = run_combo(voltage, frequency)
         if res is None:
-            return  # thermal/limit/blip while probing down — stop
+            return  # thermal/limit/blip while probing down - stop
         if combo_passes(res):
-            print(GREEN + f"{voltage}mV also clears the ceiling — trying lower for efficiency." + RESET)
+            print(GREEN + f"{voltage}mV also clears the ceiling - trying lower for efficiency." + RESET)
             voltage -= voltage_increment
         else:
             print(YELLOW + f"{voltage}mV no longer clears the ceiling; "
@@ -892,9 +892,9 @@ def _refine_probe_down(frequency, start_voltage):
 
 def _refine_sweep_at(frequency):
     """Sweep voltage upward at one frequency. Returns:
-      'passed'    — found an in-tolerance setting under the error ceiling
-      'capped'    — hit a thermal/power limit (caller should drop frequency)
-      'exhausted' — ran out of voltage headroom or couldn't proceed"""
+      'passed'    - found an in-tolerance setting under the error ceiling
+      'capped'    - hit a thermal/power limit (caller should drop frequency)
+      'exhausted' - ran out of voltage headroom or couldn't proceed"""
     voltage = initial_voltage
     first = True
     while min_allowed_voltage <= voltage <= max_allowed_voltage:
@@ -933,10 +933,11 @@ def _refine_sweep_at(frequency):
 
 
 def run_refine():
-    """Rescue an unstable ASIC: hold a frequency, sweep voltage up to the lowest
+    """Stabilize an unstable ASIC: hold a frequency, sweep voltage up to the lowest
     setting that clears the error ceiling (then probe down for efficiency). If the
-    chip is thermally boxed in — error still too high when the temp ceiling is hit —
-    drop the frequency and try again, since frequency, not voltage, is then the lever."""
+    chip hits the temperature ceiling before the error clears, drop the frequency
+    and try again, since lowering frequency (not adding voltage) is what helps once
+    cooling is the limit."""
     frequency = initial_frequency
     print(GREEN + f"Refine mode: starting at {frequency}MHz, sweeping voltage from "
                   f"{initial_voltage}mV (ceiling {max_error_rate:.1f}% error, {max_temp}°C)." + RESET)
@@ -949,9 +950,9 @@ def run_refine():
             frequency -= frequency_increment
             if frequency >= min_allowed_frequency:
                 print(YELLOW + f"Thermally capped at this frequency; dropping to {frequency}MHz "
-                               f"(frequency is the lever once the temp ceiling is hit)." + RESET)
+                               f"(lowering frequency helps once the chip is temperature-limited)." + RESET)
             continue
-        # exhausted — no more voltage headroom, or could not proceed
+        # exhausted - no more voltage headroom, or could not proceed
         print(GREEN + "Reached stability limits without clearing the ceiling. Stopping." + RESET)
         return
 
@@ -975,7 +976,7 @@ def run_efficiency():
             print(YELLOW + f"Could not benchmark the starting setting ({reason}); aborting efficiency run." + RESET)
             return
     if res is None or not combo_passes(res):
-        print(YELLOW + "Starting setting does not pass the error gate — run '--mode refine' "
+        print(YELLOW + "Starting setting does not pass the error gate - run '--mode refine' "
                        "to stabilize it first, then efficiency." + RESET)
         return
 
@@ -988,7 +989,7 @@ def run_efficiency():
         if res is None:
             break
         if combo_passes(res):
-            print(GREEN + f"{voltage}mV still clears the ceiling — trying lower for efficiency." + RESET)
+            print(GREEN + f"{voltage}mV still clears the ceiling - trying lower for efficiency." + RESET)
             voltage -= voltage_increment
         else:
             print(YELLOW + f"{voltage}mV drops below the ceiling; leanest passer is "
@@ -999,10 +1000,10 @@ def run_efficiency():
 def run_check():
     """Read-only health snapshot: measure the CURRENT setting over one window
     without changing voltage/frequency or rebooting. Nothing is applied or
-    restored — the device keeps running exactly as it was."""
+    restored - the device keeps running exactly as it was."""
     voltage, frequency = default_voltage, default_frequency
     print(GREEN + f"Health check: measuring the current setting {voltage}mV / {frequency}MHz "
-                  f"over ~{benchmark_time}s — no changes, no reboot." + RESET)
+                  f"over ~{benchmark_time}s - no changes, no reboot." + RESET)
     r = benchmark_iteration(voltage, frequency)
     if not r["ok"]:
         print(RED + f"Check could not complete ({r['reason']})." + RESET)
@@ -1011,7 +1012,7 @@ def run_check():
     gate = ("PASS" if passes_error_gate(r["errorRate"], max_error_rate) else "OVER CEILING") \
         if r["errorRate"] is not None else "no error data"
     vr = f"   VR: {r['averageVRTemp']:.1f}°C" if r["averageVRTemp"] is not None else ""
-    partial = "   (partial window — error cut it short)" if r["earlyAborted"] else ""
+    partial = "   (partial window - error cut it short)" if r["earlyAborted"] else ""
     print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz{partial}\n"
                   f"  Hashrate:   {r['averageHashRate']:.1f} GH/s\n"
                   f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
@@ -1024,14 +1025,14 @@ def print_run_expectations():
     """Set expectations before a sweep: reboots, mining downtime, rough duration."""
     per_combo_min = (sleep_time + benchmark_time) / 60.0
     ranges = {
-        "grid": "many combos — often 30 min to a few hours",
-        "refine": f"a handful of combos (more if it must drop frequency) — roughly {per_combo_min*3:.0f}-{per_combo_min*12:.0f} min",
-        "efficiency": f"a few combos — roughly {per_combo_min*2:.0f}-{per_combo_min*6:.0f} min",
+        "grid": "many combos - often 30 min to a few hours",
+        "refine": f"a handful of combos (more if it must drop frequency) - roughly {per_combo_min*3:.0f}-{per_combo_min*12:.0f} min",
+        "efficiency": f"a few combos - roughly {per_combo_min*2:.0f}-{per_combo_min*6:.0f} min",
     }
     print(YELLOW + "Before you start:" + RESET)
     print(f"  - Each combo reboots the miner and runs ~{per_combo_min:.0f} min; mining is interrupted for the whole run.")
     print(f"  - This '{benchmark_mode}' run tests {ranges.get(benchmark_mode, 'several combos')}.")
-    print("  - You can stop anytime with Ctrl+C — it restores the best setting found so far.\n")
+    print("  - You can stop anytime with Ctrl+C - it restores the best setting found so far.\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1069,7 +1070,7 @@ def main():
     total_samples = benchmark_time // sample_interval
     if total_samples - warmup_samples < 8:
         min_time = (warmup_samples + 8) * sample_interval
-        raise ValueError(RED + f"Error: Benchmark time too short — only {max(0, total_samples - warmup_samples)} "
+        raise ValueError(RED + f"Error: Benchmark time too short - only {max(0, total_samples - warmup_samples)} "
                                f"post-warmup samples (need >= 8 for a stable error mean). "
                                f"Use --benchmark-time >= {min_time}." + RESET)
 
@@ -1100,7 +1101,7 @@ def main():
                                f"{min_allowed_frequency}-{max_allowed_frequency}MHz." + RESET)
 
     if args.dry_run:
-        print(GREEN + "Dry run — resolved plan (no device changes will be made):" + RESET)
+        print(GREEN + "Dry run - resolved plan (no device changes will be made):" + RESET)
         print(f"  Device:     {bitaxe_ip}")
         print(f"  Mode:       {benchmark_mode}")
         print(f"  Start:      {initial_voltage}mV / {initial_frequency}MHz")
