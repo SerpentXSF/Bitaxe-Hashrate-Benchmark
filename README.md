@@ -6,7 +6,7 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 
 ## What this fork adds
 
-- **Error-rate measurement** — the mean `errorPercentage` over each combo's stable window, plus the raw ASIC error count accrued (`errorCountDelta`).
+- **Error-rate measurement** — a trimmed mean of `errorPercentage` over each combo's stable window (with `std`/`min`/`max` recorded), plus the raw ASIC error count accrued (`errorCountDelta`).
 - **Error gate → efficiency selection** — the "best" setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%), instead of the raw fastest. Falls back to the lowest-error setting when nothing clears the ceiling.
 - **`refine` mode** — a fast single-ASIC rescue path. Sweeps voltage upward to the lowest setting that clears the error ceiling, then probes *downward* for a leaner (better J/TH) passer. If the chip is thermally boxed in — error still too high when the temperature ceiling is reached — it automatically drops the frequency and retries, since frequency, not voltage, is the lever at that point. Combos that clearly can't clear the ceiling are aborted early (but still recorded as a fallback floor) to save time.
 - **`efficiency` mode** — for an already-healthy miner: holds the frequency and trims voltage *down* from the current setting to the leanest voltage that still clears the ceiling, cutting power/heat with no loss of hashrate.
@@ -78,8 +78,8 @@ python bitaxe_hashrate_benchmark.py <bitaxe_ip>
 ```
 
 Optional parameters:
-- `-v, --voltage`: Initial voltage in mV (grid default: 1150; refine default: device current)
-- `-f, --frequency`: Initial frequency in MHz (grid default: 500; refine default: device current)
+- `-v, --voltage`: Initial voltage in mV (grid default: 1150; refine/efficiency default: device current)
+- `-f, --frequency`: Initial frequency in MHz (grid default: 500; refine/efficiency default: device current)
 - `--mode {grid,refine,efficiency}`: full sweep (default), rescue an unstable ASIC, or trim voltage down on a healthy one
 - `--max-error <pct>`: error-rate ceiling for selecting the best setting (default: 3.5)
 - `--max-temp <C>`: chip temperature cutoff (default: 66; BM1370/Gamma often need 68)
@@ -177,8 +177,9 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
   - Temperature readings (excluding initial warmup period)
   - VR temperature readings (when available)
   - Power efficiency metrics (J/TH)
-  - Error rate (`errorRate`) and raw hardware errors over the window (`errorCountDelta`)
-  - Whether it stayed within the error ceiling (`passedErrorGate`)
+  - Error rate (`errorRate`) with its dispersion (`errorRateStd`) and raw hardware errors over the window (`errorCountDelta`)
+  - Whether it stayed within the error ceiling (`passedErrorGate`) and held hashrate in tolerance (`hashrateWithinTolerance`)
+  - Whether the window was cut short as clearly-failing (`earlyAborted`)
   - Voltage/frequency combinations tested
 
 ## Safety Features

@@ -67,9 +67,9 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Bitaxe Hashrate Benchmark Tool (error-aware)')
     parser.add_argument('bitaxe_ip', nargs='?', help='IP address of the Bitaxe (e.g., 192.168.2.26)')
     parser.add_argument('-v', '--voltage', type=int, default=None,
-                        help='Initial voltage in mV (grid default: 1150; refine default: device current)')
+                        help='Initial voltage in mV (grid default: 1150; refine/efficiency default: device current)')
     parser.add_argument('-f', '--frequency', type=int, default=None,
-                        help='Initial frequency in MHz (grid default: 500; refine default: device current)')
+                        help='Initial frequency in MHz (grid default: 500; refine/efficiency default: device current)')
     parser.add_argument('--mode', choices=['grid', 'refine', 'efficiency'], default='grid',
                         help="'grid' full sweep (default), 'refine' rescue an unstable ASIC "
                              "(sweep voltage up, drop frequency if thermally capped), or "
