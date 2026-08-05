@@ -74,6 +74,21 @@ uses the mean-percentage metric.
   error fell monotonically with voltage but hit the temp ceiling first. The
   frequency-drop behavior exists so refine handles that case on its own.)
 
+- `--mode efficiency`: for an already-healthy miner. Hold the frequency and
+  sweep voltage **down** from the current setting to the leanest voltage that
+  still clears the ceiling — cutting power/heat with no loss of hashrate. (Refine
+  rescues an erroring miner; efficiency trims a passing one.)
+
+### Post-review hardening
+
+A code review (and hardware validation) drove a second pass: `benchmark_iteration`
+returns a structured result dict rather than a positional tuple (a returned-arity
+mismatch had twice crashed a run); settings are read back and confirmed after each
+apply; a network blip retries instead of ending the run; the error gate uses a
+light trimmed mean and records dispersion; an early-aborted combo is still recorded
+as a fallback floor; and a thermally-capped grid sweep retreats frequency instead
+of stopping.
+
 ### Output
 
 - JSON (unchanged shape) gains `errorRate` and `passedErrorGate` per result.

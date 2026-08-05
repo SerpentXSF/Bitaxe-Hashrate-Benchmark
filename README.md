@@ -8,7 +8,9 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 
 - **Error-rate measurement** — the mean `errorPercentage` over each combo's stable window, plus the raw ASIC error count accrued (`errorCountDelta`).
 - **Error gate → efficiency selection** — the "best" setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%), instead of the raw fastest. Falls back to the lowest-error setting when nothing clears the ceiling.
-- **`refine` mode** — a fast single-ASIC rescue path. Sweeps voltage upward to the lowest setting that clears the error ceiling, then probes *downward* for a leaner (better J/TH) passer. If the chip is thermally boxed in — error still too high when the temperature ceiling is reached — it automatically drops the frequency and retries, since frequency, not voltage, is the lever at that point. Combos that clearly can't clear the ceiling are aborted early to save time.
+- **`refine` mode** — a fast single-ASIC rescue path. Sweeps voltage upward to the lowest setting that clears the error ceiling, then probes *downward* for a leaner (better J/TH) passer. If the chip is thermally boxed in — error still too high when the temperature ceiling is reached — it automatically drops the frequency and retries, since frequency, not voltage, is the lever at that point. Combos that clearly can't clear the ceiling are aborted early (but still recorded as a fallback floor) to save time.
+- **`efficiency` mode** — for an already-healthy miner: holds the frequency and trims voltage *down* from the current setting to the leanest voltage that still clears the ceiling, cutting power/heat with no loss of hashrate.
+- **Robustness** — settings are read back and confirmed after each apply (a failed PATCH or watchdog reboot can't mislabel a result); a transient network blip retries instead of ending the run; error dispersion (std/min/max) is recorded and the gate uses a light trimmed mean so a lone spike can't tip a borderline combo. The benchmark returns a structured result internally, so adding a field can never shift a positional unpack.
 - **Configurable chip-temp ceiling** (`--max-temp`) — BM1370/Gamma boards often idle near 65 °C and need 68 to have room to raise voltage.
 - **CSV export and a ranked summary table** (highest hashrate / most efficient / lowest error) alongside the existing JSON.
 - **Resume** (`--resume`) — reload prior results for an IP and skip already-tested combinations.
@@ -67,12 +69,19 @@ python bitaxe_hashrate_benchmark.py <bitaxe_ip>
 Optional parameters:
 - `-v, --voltage`: Initial voltage in mV (grid default: 1150; refine default: device current)
 - `-f, --frequency`: Initial frequency in MHz (grid default: 500; refine default: device current)
-- `--mode {grid,refine}`: full sweep (default) or voltage-only sweep at a fixed frequency
+- `--mode {grid,refine,efficiency}`: full sweep (default), rescue an unstable ASIC, or trim voltage down on a healthy one
 - `--max-error <pct>`: error-rate ceiling for selecting the best setting (default: 3.5)
 - `--max-temp <C>`: chip temperature cutoff (default: 66; BM1370/Gamma often need 68)
 - `--no-error-gate`: report the error rate but do not use it to gate selection
 - `--resume`: reload prior results for this IP and skip already-tested combos
 - `--benchmark-time <s>`: override the per-combo window in seconds (default: 600)
+- `--voltage-step <mV>` / `--frequency-step <MHz>`: sweep increments (defaults: 20 / 25)
+- `--dry-run`: print the resolved plan and exit without touching the device
+
+Trim a healthy miner for efficiency (hold frequency, lower voltage while it still passes):
+```bash
+python bitaxe_hashrate_benchmark.py 192.168.2.29 --mode efficiency --max-error 3.5
+```
 
 Full sweep example:
 ```bash
@@ -114,13 +123,13 @@ The script includes several configurable parameters:
 - Sample interval: 15 seconds
 - Sleep time before benchmark: 90 seconds
 - Error-rate ceiling: 3.5% (override with `--max-error`)
-- **Minimum required samples: 7** (for valid data processing)
-- Voltage increment: 20mV
-- Frequency increment: 25MHz
+- **Minimum required samples: at least 8 post-warmup** (so `--benchmark-time` must be ≥ 210s at the default 15s interval)
+- Voltage increment: 20mV (override with `--voltage-step`)
+- Frequency increment: 25MHz (override with `--frequency-step`)
 
 ## A note on the error metric
 
-The device's `errorPercentage` is a noisy rolling rate, not a cumulative ratio — it can swing sample to sample. The per-combo figure is therefore the **mean of `errorPercentage` across the stable window** (warmup samples excluded), which reproduces the number AxeOS reports. The raw `errorCount` delta over the fixed-length window is recorded separately as `errorCountDelta`, a directly-comparable error-volume diagnostic. If a device does not expose error data, the error rate is reported as unknown and never disqualifies a combination.
+The device's `errorPercentage` is a noisy rolling rate, not a cumulative ratio — it can swing sample to sample. The per-combo figure is therefore an average of `errorPercentage` across the stable window (warmup samples excluded), which reproduces the number AxeOS reports. With ≥5 samples it uses a **light trimmed mean** (dropping one extreme at each end) so a lone spike can't tip a borderline combo across the ceiling, and the dispersion (`std`/`min`/`max`) is recorded alongside it. The raw `errorCount` delta over the fixed-length window is recorded separately as `errorCountDelta`, a directly-comparable error-volume diagnostic. If a device does not expose error data, the error rate is reported as unknown, a one-time notice is printed, and it never disqualifies a combination.
 
 ## Output
 
@@ -162,9 +171,9 @@ python -m pytest tests/
 
 The tool implements several data processing techniques to ensure accurate results:
 - Removes 3 highest and 3 lowest hashrate readings to eliminate outliers (when enough samples exist)
-- Excludes warmup readings when averaging temperature and error rate
+- Excludes warmup readings (chronologically) when averaging temperature, power, and error rate
 - Validates hashrate is within 6% of theoretical maximum
-- Averages power consumption across entire test period
+- Averages power consumption over the post-warmup window (same window as hashrate/error, so J/TH is comparable across settings)
 - Monitors VR temperature when available
 - Calculates efficiency in Joules per Terahash (J/TH)
 

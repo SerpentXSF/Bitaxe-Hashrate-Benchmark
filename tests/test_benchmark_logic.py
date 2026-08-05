@@ -152,66 +152,99 @@ class TestSelectBest(unittest.TestCase):
         self.assertIsNone(b.select_best([], 3.5))
 
 
-class TestBenchmarkIterationArity(unittest.TestCase):
-    """Guard against the success/failure return tuples drifting out of sync
-    (a mismatch crashes the caller's 8-value unpack on real hardware)."""
+class TestErrorStatsAndTrim(unittest.TestCase):
+    def test_trimmed_mean_when_enough_samples(self):
+        # 5 samples [1,2,3,4,100] -> drop the 1 and the 100 -> mean(2,3,4) = 3.
+        s = [sample(None, x) for x in (1, 2, 3, 4, 100)]
+        rate, method = b.compute_window_error(s)
+        self.assertEqual(method, "errorPercentage-trimmed-mean")
+        self.assertAlmostEqual(rate, 3.0, places=6)
 
-    EXPECTED_LEN = 8
+    def test_plain_mean_when_few_samples(self):
+        rate, method = b.compute_window_error([sample(None, 2.0), sample(None, 4.0)])
+        self.assertEqual(method, "errorPercentage-mean")
+        self.assertAlmostEqual(rate, 3.0, places=6)
+
+    def test_error_stats(self):
+        st = b.window_error_stats([sample(None, 2.0), sample(None, 4.0), sample(None, 6.0)])
+        self.assertEqual((st["min"], st["max"], st["n"]), (2.0, 6.0, 3))
+        self.assertGreater(st["std"], 0)
+
+    def test_error_stats_none_without_data(self):
+        self.assertIsNone(b.window_error_stats([sample(1, None)]))
+
+
+class TestBenchmarkIterationResult(unittest.TestCase):
+    """benchmark_iteration returns a result DICT (fields read by name), which
+    removes the positional-arity crash class that bit the old tuple twice."""
 
     def setUp(self):
-        self._saved = (b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval)
+        self._saved = (b.small_core_count, b.asic_count, b.benchmark_time,
+                       b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results)
         b.small_core_count = 2040
         b.asic_count = 1
         b.benchmark_time = 20
         b.sample_interval = 1
+        b.error_gate_enabled = True
+        b.max_error_rate = 3.5
+        b.results = []
 
     def tearDown(self):
-        b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval = self._saved
+        (b.small_core_count, b.asic_count, b.benchmark_time,
+         b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results) = self._saved
 
-    def test_iter_fail_matches_success_length(self):
-        self.assertEqual(len(b._iter_fail("X")), self.EXPECTED_LEN)
-
-    def test_success_returns_eight(self):
-        with mock.patch.object(b, "get_system_info", return_value=make_info()), \
+    def _run(self, info_or_seq):
+        kw = {"side_effect": info_or_seq} if isinstance(info_or_seq, list) else {"return_value": info_or_seq}
+        with mock.patch.object(b, "get_system_info", **kw), \
              mock.patch.object(b.time, "sleep", return_value=None):
-            result = b.benchmark_iteration(1150, 525)
-        self.assertEqual(len(result), self.EXPECTED_LEN)
-        self.assertIsNotNone(result[0])          # hashrate
-        self.assertIsNotNone(result[6])          # error rate
+            return b.benchmark_iteration(1150, 525)
 
-    def test_guard_abort_returns_eight(self):
-        # Chip over temp on every sample -> guard return, must still be 8-wide.
-        with mock.patch.object(b, "get_system_info", return_value=make_info(temp=99)), \
-             mock.patch.object(b.time, "sleep", return_value=None):
-            result = b.benchmark_iteration(1150, 525)
-        self.assertEqual(len(result), self.EXPECTED_LEN)
-        self.assertIsNone(result[0])
-        self.assertEqual(result[5], "CHIP_TEMP_EXCEEDED")
+    def test_iter_fail_is_dict(self):
+        r = b._iter_fail("X")
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "X")
 
-    def test_boot_glitch_samples_are_skipped_not_aborted(self):
-        # First few samples read a warmup temp<5, then the device comes up.
+    def test_success(self):
+        r = self._run(make_info())
+        self.assertTrue(r["ok"])
+        self.assertIsNotNone(r["averageHashRate"])
+        self.assertIsNotNone(r["errorRate"])
+        self.assertFalse(r["earlyAborted"])
+
+    def test_thermal_guard(self):
+        r = self._run(make_info(temp=99))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "CHIP_TEMP_EXCEEDED")
+
+    def test_zero_hashrate(self):
+        r = self._run(make_info(hr=0))
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "ZERO_HASHRATE")
+
+    def test_boot_glitch_skipped(self):
         seq = [make_info(temp=2) for _ in range(3)] + [make_info() for _ in range(20)]
-        with mock.patch.object(b, "get_system_info", side_effect=seq), \
-             mock.patch.object(b.time, "sleep", return_value=None):
-            result = b.benchmark_iteration(1150, 525)
-        self.assertEqual(len(result), self.EXPECTED_LEN)
-        self.assertIsNotNone(result[0])          # still produced a valid average
+        r = self._run(seq)
+        self.assertTrue(r["ok"])
+        self.assertIsNotNone(r["averageHashRate"])
 
-    def test_zero_hashrate_returns_eight(self):
-        # Regression for the ZERO_HASHRATE path (was a 7-tuple that crashed callers).
-        with mock.patch.object(b, "get_system_info", return_value=make_info(hr=0)), \
-             mock.patch.object(b.time, "sleep", return_value=None):
-            result = b.benchmark_iteration(1150, 525)
-        self.assertEqual(len(result), self.EXPECTED_LEN)
-        self.assertEqual(result[5], "ZERO_HASHRATE")
+    def test_unreachable_error_records_early_floor(self):
+        # Sustained error over the ceiling -> abort early, but still a recorded
+        # (partial) floor so select_best always has a fallback.
+        r = self._run(make_info(ep=20.0))
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["earlyAborted"])
+        self.assertEqual(r["reason"], "EARLY_ABORT")
+        self.assertFalse(b.passes_error_gate(r["errorRate"], 3.5))
 
-    def test_unreachable_error_aborts_early(self):
-        # Sustained error far over the ceiling -> abort early with an 8-tuple.
-        with mock.patch.object(b, "get_system_info", return_value=make_info(ep=20.0)), \
-             mock.patch.object(b.time, "sleep", return_value=None):
-            result = b.benchmark_iteration(1150, 525)
-        self.assertEqual(len(result), self.EXPECTED_LEN)
-        self.assertEqual(result[5], "ERROR_CEILING_UNREACHABLE")
+    def test_single_spike_does_not_early_abort(self):
+        # One 100% rolling-rate spike among otherwise-low readings must NOT abort:
+        # the bound drops the max, mirroring the trimmed-mean final metric.
+        seq = ([make_info(ep=1.0) for _ in range(6)] + [make_info(ep=100.0)]
+               + [make_info(ep=1.0) for _ in range(13)])
+        r = self._run(seq)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["earlyAborted"])
+        self.assertTrue(b.passes_error_gate(r["errorRate"], 3.5))
 
 
 class TestRefineControlFlow(unittest.TestCase):
@@ -257,6 +290,14 @@ class TestRefineControlFlow(unittest.TestCase):
         tried_freqs = {f for _, f in calls}
         self.assertIn(600, tried_freqs)
         self.assertIn(575, tried_freqs)   # dropped by frequency_increment (25)
+
+    def test_resume_uses_recorded_passer(self):
+        # A resumed refine must honor a recorded passing combo, not climb past it.
+        b.resume_enabled = True
+        b.results = [self._passing(b.initial_voltage, b.initial_frequency)]
+        with mock.patch.object(b, "run_combo", return_value=(None, "CHIP_TEMP_EXCEEDED")):
+            outcome = b._refine_sweep_at(b.initial_frequency)
+        self.assertEqual(outcome, "passed")
 
 
 if __name__ == "__main__":

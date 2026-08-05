@@ -69,8 +69,16 @@ def parse_arguments():
                         help='Initial voltage in mV (grid default: 1150; refine default: device current)')
     parser.add_argument('-f', '--frequency', type=int, default=None,
                         help='Initial frequency in MHz (grid default: 500; refine default: device current)')
-    parser.add_argument('--mode', choices=['grid', 'refine'], default='grid',
-                        help="'grid' full sweep (default) or 'refine' voltage-only sweep at a fixed frequency")
+    parser.add_argument('--mode', choices=['grid', 'refine', 'efficiency'], default='grid',
+                        help="'grid' full sweep (default), 'refine' rescue an unstable ASIC "
+                             "(sweep voltage up, drop frequency if thermally capped), or "
+                             "'efficiency' trim voltage down on an already-healthy miner")
+    parser.add_argument('--voltage-step', type=int, default=None,
+                        help='Voltage increment in mV (default: 20)')
+    parser.add_argument('--frequency-step', type=int, default=None,
+                        help='Frequency increment in MHz (default: 25)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Print the resolved plan and exit without touching the device')
     parser.add_argument('--max-error', type=float, default=3.5,
                         help='Error-rate ceiling in percent for selecting the best setting (default: 3.5)')
     parser.add_argument('--max-temp', type=int, default=66,
@@ -115,16 +123,35 @@ def sum_error_count(info):
 
 
 def compute_window_error(samples):
-    """Mean ASIC error rate (percent) over a combo's post-warmup samples.
+    """ASIC error rate (percent) over a combo's post-warmup samples.
 
     The device's `errorPercentage` is a noisy rolling rate (not a cumulative
-    ratio), so averaging it across the stable window is the faithful, robust
-    metric — it matches what AxeOS reports. Each sample is a dict with
-    'error_percentage' (float|None). Returns (rate_or_None, method_string)."""
+    ratio), so we average it across the stable window — the faithful metric that
+    matches what AxeOS reports. With enough samples we drop one extreme at each
+    end (a light trimmed mean) so a single spike can't tip a borderline combo
+    across the ceiling. Each sample is a dict with 'error_percentage'
+    (float|None). Returns (rate_or_None, method_string)."""
     eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
-    if eps:
-        return (sum(eps) / len(eps), 'errorPercentage-mean')
-    return (None, 'unavailable')
+    if not eps:
+        return (None, 'unavailable')
+    if len(eps) >= 5:
+        trimmed = sorted(eps)[1:-1]
+        return (sum(trimmed) / len(trimmed), 'errorPercentage-trimmed-mean')
+    return (sum(eps) / len(eps), 'errorPercentage-mean')
+
+
+def window_error_stats(samples):
+    """Dispersion of a window's error readings: sample std / min / max / count.
+
+    A large spread flags a suspect measurement (worth re-checking a combo that
+    lands right on the ceiling). Returns a dict, or None with no error data."""
+    eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
+    if not eps:
+        return None
+    n = len(eps)
+    mean = sum(eps) / n
+    std = (sum((x - mean) ** 2 for x in eps) / (n - 1)) ** 0.5 if n >= 2 else 0.0
+    return {"std": std, "min": min(eps), "max": max(eps), "n": n}
 
 
 def window_error_count(samples):
@@ -172,12 +199,14 @@ def select_best(all_results, ceiling, gate_enabled=True):
     if passers:
         return sorted(passers, key=lambda r: (r['efficiencyJTH'], -r['averageHashRate']))[0]
 
-    # Nothing passed — prefer in-tolerance, then lowest error, then efficiency.
+    # Nothing passed — prefer in-tolerance and full-window data, then lowest
+    # error, then efficiency. (Early-aborted combos are partial-window floors.)
     def err_key(r):
         er = r.get('errorRate')
         return er if er is not None else float('inf')
 
-    return sorted(all_results, key=lambda r: (not in_tolerance(r), err_key(r), r['efficiencyJTH']))[0]
+    return sorted(all_results, key=lambda r: (not in_tolerance(r), bool(r.get('earlyAborted')),
+                                              err_key(r), r['efficiencyJTH']))[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -279,7 +308,7 @@ def get_system_info():
     return None
 
 
-def set_system_settings(core_voltage, frequency):
+def set_system_settings(core_voltage, frequency, skip_wait=False):
     settings = {
         "coreVoltage": core_voltage,
         "frequency": frequency
@@ -289,25 +318,25 @@ def set_system_settings(core_voltage, frequency):
         response.raise_for_status()
         print(YELLOW + f"Applying settings: Voltage = {core_voltage}mV, Frequency = {frequency}MHz" + RESET)
         time.sleep(2)
-        restart_system()
+        restart_system(skip_wait=skip_wait)
     except requests.exceptions.RequestException as e:
         print(RED + f"Error setting system settings: {e}" + RESET)
 
 
-def restart_system():
+def restart_system(skip_wait=False):
     try:
-        is_interrupt = handling_interrupt
-
-        # Restart here as some bitaxes get unstable with bad settings.
-        if not is_interrupt:
+        # Wait for stabilization before benchmarking, but not on an interrupt or a
+        # final restore (skip_wait) — nothing is measured after those, so the 90 s
+        # sleep would just delay exit.
+        if handling_interrupt or skip_wait:
+            print(YELLOW + "Applying final settings..." + RESET)
+            response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
+            response.raise_for_status()
+        else:
             print(YELLOW + f"Applying new settings and waiting {sleep_time}s for system stabilization..." + RESET)
             response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
             response.raise_for_status()
             time.sleep(sleep_time)
-        else:
-            print(YELLOW + "Applying final settings..." + RESET)
-            response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
-            response.raise_for_status()
     except requests.exceptions.RequestException as e:
         print(RED + f"Error restarting the system: {e}" + RESET)
 
@@ -331,11 +360,111 @@ def apply_settings(core_voltage, frequency):
     return False
 
 
+def _iter_result(ok=False, reason=None, **kw):
+    """Structured return for benchmark_iteration. Returning a dict (not a
+    positional tuple) means callers read fields by name, so adding a field can
+    never silently shift an unpack and crash a run mid-sweep."""
+    r = {
+        "ok": ok,
+        "reason": reason,
+        "averageHashRate": None,
+        "averageTemperature": None,
+        "efficiencyJTH": None,
+        "hashrateWithinTolerance": False,
+        "averageVRTemp": None,
+        "errorRate": None,
+        "errorCountDelta": None,
+        "errorStats": None,
+        "earlyAborted": False,
+    }
+    r.update(kw)
+    return r
+
+
 def _iter_fail(reason):
-    """Uniform failure return for benchmark_iteration, matching the 8-value
-    success tuple: (hashrate, temp, jth, hashrate_ok, vr_temp, reason, error_rate,
-    error_count_delta)."""
-    return None, None, None, False, None, reason, None, None
+    return _iter_result(ok=False, reason=reason)
+
+
+_no_error_data_warned = False
+
+
+def _warn_no_error_data():
+    """One-time prominent notice that the gate is inert on this device."""
+    global _no_error_data_warned
+    if not _no_error_data_warned:
+        print(YELLOW + "Note: this device exposes no error-rate data — the error gate is inert "
+                       "and best-setting selection falls back to pure J/TH." + RESET)
+        _no_error_data_warned = True
+
+
+def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
+                     error_samples, expected_hashrate, early=False):
+    """Turn a window's collected samples into a result dict. Called both at
+    end-of-window and on an early abort — so a marginal device that never clears
+    the ceiling still leaves a recorded (partial) floor for select_best."""
+    if not (hash_rates and temperatures and power_consumptions):
+        print(YELLOW + "No Hashrate or Temperature or Watts data collected." + RESET)
+        return _iter_fail("NO_DATA_COLLECTED")
+
+    # Hashrate: drop 3 high + 3 low as outliers when there is enough data.
+    sorted_hashrates = sorted(hash_rates)
+    trimmed_hashrates = sorted_hashrates[3:-3] if len(sorted_hashrates) > 6 else sorted_hashrates
+    average_hashrate = sum(trimmed_hashrates) / len(trimmed_hashrates)
+
+    # Temp/VR/power: drop the warmup samples chronologically (the first N), not by
+    # value — clipping the lowest readings anywhere would bias the average high.
+    chron_temps = temperatures[warmup_samples:] if len(temperatures) > warmup_samples else temperatures
+    average_temperature = sum(chron_temps) / len(chron_temps)
+
+    average_vr_temp = None
+    if vr_temps:
+        chron_vr = vr_temps[warmup_samples:] if len(vr_temps) > warmup_samples else vr_temps
+        average_vr_temp = sum(chron_vr) / len(chron_vr)
+
+    trimmed_power = power_consumptions[warmup_samples:] if len(power_consumptions) > warmup_samples else power_consumptions
+    average_power = sum(trimmed_power) / len(trimmed_power)
+
+    if average_hashrate <= 0:
+        print(RED + "Warning: Zero hashrate detected, skipping efficiency calculation" + RESET)
+        return _iter_fail("ZERO_HASHRATE")
+    efficiency_jth = average_power / (average_hashrate / 1_000)
+
+    error_window = error_samples[warmup_samples:]
+    error_rate, error_method = compute_window_error(error_window)
+    error_count_delta = window_error_count(error_window)
+    error_stats = window_error_stats(error_window)
+
+    hashrate_within_tolerance = (average_hashrate >= expected_hashrate * 0.94)
+
+    tag = " [early]" if early else ""
+    print(GREEN + f"Average Hashrate{tag}: {average_hashrate:.2f} GH/s (Expected: {expected_hashrate:.2f} GH/s)" + RESET)
+    print(GREEN + f"Average Temperature: {average_temperature:.2f}°C" + RESET)
+    if average_vr_temp is not None:
+        print(GREEN + f"Average VR Temperature: {average_vr_temp:.2f}°C" + RESET)
+    print(GREEN + f"Efficiency: {efficiency_jth:.2f} J/TH" + RESET)
+    if error_rate is not None:
+        gate_note = "PASS" if passes_error_gate(error_rate, max_error_rate) else "OVER CEILING"
+        colour = GREEN if gate_note == "PASS" else RED
+        extra = f", {error_count_delta} hw errors" if error_count_delta is not None else ""
+        spread = f" (±{error_stats['std']:.1f})" if (error_stats and error_stats.get("std") is not None) else ""
+        method_label = "trimmed mean" if "trimmed" in error_method else "mean"
+        print(colour + f"Error Rate: {error_rate:.2f}%{spread} ({method_label}{extra}) [{gate_note} @ {max_error_rate:.1f}%]" + RESET)
+    else:
+        _warn_no_error_data()
+
+    return _iter_result(
+        ok=True,
+        reason=("EARLY_ABORT" if early else None),
+        averageHashRate=average_hashrate,
+        averageTemperature=average_temperature,
+        efficiencyJTH=efficiency_jth,
+        hashrateWithinTolerance=hashrate_within_tolerance,
+        averageVRTemp=average_vr_temp,
+        errorRate=error_rate,
+        errorCountDelta=error_count_delta,
+        errorStats=error_stats,
+        earlyAborted=early,
+    )
 
 
 def benchmark_iteration(core_voltage, frequency):
@@ -424,80 +553,33 @@ def benchmark_iteration(core_voltage, frequency):
         print(status_line + RESET)
 
         # Early abort: if even a perfect (0%) remainder can't pull the window mean
-        # under the ceiling, this combo is hopeless — don't waste the rest of it.
+        # under the ceiling, this combo is hopeless. Finalize the partial window
+        # anyway so it's recorded as a floor rather than discarded.
         if error_gate_enabled:
             post = error_samples[warmup_samples:]
             eps_post = [s['error_percentage'] for s in post if s['error_percentage'] is not None]
             total_post = total_samples - warmup_samples
-            if len(eps_post) >= 4 and total_post > 0:
-                best_case_mean = sum(eps_post) / total_post
+            if len(eps_post) >= 5 and total_post > 2:
+                # Best case = all remaining samples read 0%. Mirror the final trimmed
+                # mean (drop one high + one low) so a lone rolling-rate spike can't
+                # permanently abort a combo whose full-window mean would have passed.
+                best_case_mean = (sum(eps_post) - max(eps_post)) / (total_post - 2)
                 if best_case_mean > max_error_rate:
-                    print(RED + f"Error ceiling unreachable (best-case mean {best_case_mean:.1f}% > "
+                    print(RED + f"Error ceiling unreachable (best-case trimmed mean {best_case_mean:.1f}% > "
                                 f"{max_error_rate:.1f}%); aborting combo early." + RESET)
-                    return _iter_fail("ERROR_CEILING_UNREACHABLE")
+                    return _finalize_window(hash_rates, temperatures, power_consumptions,
+                                            vr_temps, error_samples, expected_hashrate, early=True)
 
         if sample < total_samples - 1:
             time.sleep(sample_interval)
 
-    if hash_rates and temperatures and power_consumptions:
-        # Remove 3 highest and 3 lowest hashrates in case of outliers (only when
-        # there are enough samples for trimming to leave data behind).
-        sorted_hashrates = sorted(hash_rates)
-        trimmed_hashrates = sorted_hashrates[3:-3] if len(sorted_hashrates) > 6 else sorted_hashrates
-        average_hashrate = sum(trimmed_hashrates) / len(trimmed_hashrates)
-
-        # Sort and trim temperatures (remove lowest readings during warmup)
-        sorted_temps = sorted(temperatures)
-        trimmed_temps = sorted_temps[warmup_samples:] if len(sorted_temps) > warmup_samples else sorted_temps
-        average_temperature = sum(trimmed_temps) / len(trimmed_temps)
-
-        average_vr_temp = None
-        if vr_temps:
-            sorted_vr_temps = sorted(vr_temps)
-            trimmed_vr_temps = sorted_vr_temps[warmup_samples:] if len(sorted_vr_temps) > warmup_samples else sorted_vr_temps
-            average_vr_temp = sum(trimmed_vr_temps) / len(trimmed_vr_temps)
-
-        # Average power over the same post-warmup window as hashrate/error so the
-        # J/TH comparison across combos is apples-to-apples (warmup power is low
-        # and would bias efficiency optimistic).
-        trimmed_power = power_consumptions[warmup_samples:] if len(power_consumptions) > warmup_samples else power_consumptions
-        average_power = sum(trimmed_power) / len(trimmed_power)
-
-        if average_hashrate > 0:
-            efficiency_jth = average_power / (average_hashrate / 1_000)
-        else:
-            print(RED + "Warning: Zero hashrate detected, skipping efficiency calculation" + RESET)
-            return _iter_fail("ZERO_HASHRATE")
-
-        # Error rate from the stable tail of the window (skip warmup samples).
-        error_window = error_samples[warmup_samples:]
-        error_rate, error_method = compute_window_error(error_window)
-        error_count_delta = window_error_count(error_window)
-
-        hashrate_within_tolerance = (average_hashrate >= expected_hashrate * 0.94)
-
-        print(GREEN + f"Average Hashrate: {average_hashrate:.2f} GH/s (Expected: {expected_hashrate:.2f} GH/s)" + RESET)
-        print(GREEN + f"Average Temperature: {average_temperature:.2f}°C" + RESET)
-        if average_vr_temp is not None:
-            print(GREEN + f"Average VR Temperature: {average_vr_temp:.2f}°C" + RESET)
-        print(GREEN + f"Efficiency: {efficiency_jth:.2f} J/TH" + RESET)
-        if error_rate is not None:
-            gate_note = "PASS" if passes_error_gate(error_rate, max_error_rate) else "OVER CEILING"
-            colour = GREEN if gate_note == "PASS" else RED
-            extra = f", {error_count_delta} hw errors" if error_count_delta is not None else ""
-            print(colour + f"Error Rate: {error_rate:.2f}% (mean{extra}) [{gate_note} @ {max_error_rate:.1f}%]" + RESET)
-        else:
-            print(YELLOW + "Error Rate: unavailable (no error data from device)" + RESET)
-
-        return (average_hashrate, average_temperature, efficiency_jth, hashrate_within_tolerance,
-                average_vr_temp, None, error_rate, error_count_delta)
-    else:
-        print(YELLOW + "No Hashrate or Temperature or Watts data collected." + RESET)
-        return None, None, None, False, None, "NO_DATA_COLLECTED", None, None
+    return _finalize_window(hash_rates, temperatures, power_consumptions,
+                            vr_temps, error_samples, expected_hashrate, early=False)
 
 
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
-                  avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True):
+                  avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
+                  error_stats=None, early_aborted=False):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
@@ -508,7 +590,12 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "errorCountDelta": error_count_delta,
         "passedErrorGate": passes_error_gate(error_rate, max_error_rate),
         "hashrateWithinTolerance": hashrate_ok,
+        "earlyAborted": early_aborted,
     }
+    if error_stats is not None:
+        result["errorRateStd"] = error_stats.get("std")
+        result["errorRateMin"] = error_stats.get("min")
+        result["errorRateMax"] = error_stats.get("max")
     if avg_vr_temp is not None:
         result["averageVRTemp"] = avg_vr_temp
     results.append(result)
@@ -516,7 +603,13 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
 
 
 def already_tested(core_voltage, frequency):
-    return any(r["coreVoltage"] == core_voltage and r["frequency"] == frequency for r in results)
+    return _recorded(core_voltage, frequency) is not None
+
+
+def _recorded(core_voltage, frequency):
+    """Return the recorded result for a combo, or None if it hasn't been run."""
+    return next((r for r in results if r["coreVoltage"] == core_voltage
+                 and r["frequency"] == frequency), None)
 
 
 def results_filename(ext):
@@ -567,8 +660,9 @@ def save_csv():
     try:
         filename = results_filename("csv")
         fields = ["coreVoltage", "frequency", "averageHashRate", "efficiencyJTH",
-                  "errorRate", "errorCountDelta", "passedErrorGate",
-                  "hashrateWithinTolerance", "averageTemperature", "averageVRTemp"]
+                  "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate",
+                  "hashrateWithinTolerance", "earlyAborted",
+                  "averageTemperature", "averageVRTemp"]
         with open(filename, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -583,7 +677,7 @@ def reset_to_best_setting():
     best_result = select_best(results, max_error_rate, error_gate_enabled)
     if best_result is None:
         print(YELLOW + "No valid benchmarking results found. Applying predefined default settings." + RESET)
-        set_system_settings(default_voltage, default_frequency)
+        set_system_settings(default_voltage, default_frequency, skip_wait=True)
     else:
         best_voltage = best_result["coreVoltage"]
         best_frequency = best_result["frequency"]
@@ -596,7 +690,7 @@ def reset_to_best_setting():
                       f"  Core Voltage: {best_voltage}mV\n"
                       f"  Frequency: {best_frequency}MHz\n"
                       f"  Efficiency: {best_result['efficiencyJTH']:.2f} J/TH | Error: {er_str}" + RESET)
-        set_system_settings(best_voltage, best_frequency)
+        set_system_settings(best_voltage, best_frequency, skip_wait=True)
     # set_system_settings already restarts; no extra reboot needed here.
 
 
@@ -650,9 +744,11 @@ def save_final_json():
             "averageTemperature": r["averageTemperature"],
             "efficiencyJTH": r["efficiencyJTH"],
             "errorRate": r.get("errorRate"),
+            "errorRateStd": r.get("errorRateStd"),
             "errorCountDelta": r.get("errorCountDelta"),
             "passedErrorGate": r.get("passedErrorGate"),
             "hashrateWithinTolerance": r.get("hashrateWithinTolerance"),
+            "earlyAborted": r.get("earlyAborted", False),
         }
         if "averageVRTemp" in r:
             out["averageVRTemp"] = r["averageVRTemp"]
@@ -688,17 +784,18 @@ def run_combo(voltage, frequency):
     for attempt in range(2):
         if not apply_settings(voltage, frequency):
             return None, "APPLY_FAILED"
-        (avg_hashrate, avg_temp, efficiency_jth, hashrate_ok, avg_vr_temp,
-         error_reason, error_rate, error_count_delta) = benchmark_iteration(voltage, frequency)
-        if avg_hashrate is not None and avg_temp is not None and efficiency_jth is not None:
-            res = record_result(voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
-                                avg_vr_temp, error_rate, error_count_delta, hashrate_ok)
+        r = benchmark_iteration(voltage, frequency)
+        if r["ok"]:
+            res = record_result(voltage, frequency, r["averageHashRate"], r["averageTemperature"],
+                                r["efficiencyJTH"], r["averageVRTemp"], r["errorRate"],
+                                r["errorCountDelta"], r["hashrateWithinTolerance"],
+                                error_stats=r["errorStats"], early_aborted=r["earlyAborted"])
             save_results()
-            return res, None
-        if error_reason == "SYSTEM_INFO_FAILURE" and attempt == 0:
+            return res, r["reason"]
+        if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
             print(YELLOW + "Network hiccup during combo; retrying once." + RESET)
             continue
-        return None, error_reason
+        return None, r["reason"]
     return None, "SYSTEM_INFO_FAILURE"
 
 
@@ -714,8 +811,18 @@ def run_grid():
 
     while current_voltage <= max_allowed_voltage and current_frequency <= max_allowed_frequency:
         if resume_enabled and already_tested(current_voltage, current_frequency):
+            rec = next((r for r in results if r["coreVoltage"] == current_voltage
+                        and r["frequency"] == current_frequency), None)
             print(YELLOW + f"Resume: skipping already-tested {current_voltage}mV / {current_frequency}MHz" + RESET)
-            current_frequency += frequency_increment
+            # Replay the same branch the live run would have taken from this combo.
+            if rec is not None and not combo_passes(rec):
+                if current_voltage + voltage_increment <= max_allowed_voltage:
+                    current_voltage += voltage_increment
+                    current_frequency -= frequency_increment
+                else:
+                    break
+            else:
+                current_frequency += frequency_increment
             continue
 
         res, reason = run_combo(current_voltage, current_frequency)
@@ -737,8 +844,17 @@ def run_grid():
                                    f"and increasing voltage to {current_voltage}mV" + RESET)
                 else:
                     break
+        elif reason in THERMAL_REASONS:
+            # Thermally capped: retreat frequency and add voltage, like an unstable combo.
+            if current_voltage + voltage_increment <= max_allowed_voltage:
+                current_voltage += voltage_increment
+                current_frequency -= frequency_increment
+                print(YELLOW + f"Thermally capped ({reason}). Decreasing frequency to {current_frequency}MHz "
+                               f"and increasing voltage to {current_voltage}mV" + RESET)
+            else:
+                break
         else:
-            print(GREEN + "Reached thermal or stability limits. Stopping further testing." + RESET)
+            print(GREEN + f"Stopping further testing ({reason or 'stability limit'})." + RESET)
             break
 
 
@@ -749,6 +865,9 @@ def _refine_probe_down(frequency, start_voltage):
     voltage = start_voltage - voltage_increment
     while voltage >= min_allowed_voltage:
         if resume_enabled and already_tested(voltage, frequency):
+            rec = _recorded(voltage, frequency)
+            if rec is not None and not combo_passes(rec):
+                return  # known failure here — the lowest passer is above this
             voltage -= voltage_increment
             continue
         res, reason = run_combo(voltage, frequency)
@@ -772,8 +891,16 @@ def _refine_sweep_at(frequency):
     first = True
     while min_allowed_voltage <= voltage <= max_allowed_voltage:
         if resume_enabled and already_tested(voltage, frequency):
+            rec = _recorded(voltage, frequency)
             print(YELLOW + f"Resume: skipping already-tested {voltage}mV / {frequency}MHz" + RESET)
+            # Replay the recorded outcome: a known passer ends this frequency;
+            # a known failure means keep climbing voltage.
+            if rec is not None and combo_passes(rec):
+                if first:
+                    _refine_probe_down(frequency, voltage)
+                return "passed"
             voltage += voltage_increment
+            first = False
             continue
 
         res, reason = run_combo(voltage, frequency)
@@ -784,17 +911,13 @@ def _refine_sweep_at(frequency):
                 if first:
                     _refine_probe_down(frequency, voltage)
                 return "passed"
-            # Recorded but over ceiling / low hashrate: needs more voltage.
+            # Recorded but over ceiling / low hashrate (incl. an early-aborted
+            # partial window): needs more voltage.
             voltage += voltage_increment
             first = False
             print(YELLOW + f"Raising voltage to {voltage}mV to reduce error / stabilize." + RESET)
         elif reason in THERMAL_REASONS:
             return "capped"
-        elif reason == "ERROR_CEILING_UNREACHABLE":
-            # Too much error at this voltage (aborted early): add voltage and continue.
-            voltage += voltage_increment
-            first = False
-            print(YELLOW + f"Raising voltage to {voltage}mV to reduce error." + RESET)
         else:
             return "exhausted"
 
@@ -824,6 +947,46 @@ def run_refine():
         print(GREEN + "Reached stability limits without clearing the ceiling. Stopping." + RESET)
         return
 
+    print(GREEN + "Reached the frequency floor without clearing the ceiling. Stopping." + RESET)
+
+
+def run_efficiency():
+    """For an already-healthy miner: hold the frequency and trim voltage DOWN from
+    the current setting to the leanest voltage that still clears the error ceiling.
+    Refine rescues; this squeezes J/TH out of a miner that already passes."""
+    frequency = initial_frequency
+    voltage = initial_voltage
+    print(GREEN + f"Efficiency mode: {frequency}MHz fixed, trimming voltage down from "
+                  f"{voltage}mV while staying under {max_error_rate:.1f}% error." + RESET)
+
+    if resume_enabled and already_tested(voltage, frequency):
+        res = _recorded(voltage, frequency)
+    else:
+        res, reason = run_combo(voltage, frequency)
+        if res is None:
+            print(YELLOW + f"Could not benchmark the starting setting ({reason}); aborting efficiency run." + RESET)
+            return
+    if res is None or not combo_passes(res):
+        print(YELLOW + "Starting setting does not pass the error gate — run '--mode refine' "
+                       "to stabilize it first, then efficiency." + RESET)
+        return
+
+    voltage -= voltage_increment
+    while voltage >= min_allowed_voltage:
+        if resume_enabled and already_tested(voltage, frequency):
+            voltage -= voltage_increment
+            continue
+        res, _ = run_combo(voltage, frequency)
+        if res is None:
+            break
+        if combo_passes(res):
+            print(GREEN + f"{voltage}mV still clears the ceiling — trying lower for efficiency." + RESET)
+            voltage -= voltage_increment
+        else:
+            print(YELLOW + f"{voltage}mV drops below the ceiling; leanest passer is "
+                           f"{voltage + voltage_increment}mV." + RESET)
+            break
+
 
 # --------------------------------------------------------------------------- #
 # Entry point                                                                 #
@@ -832,7 +995,7 @@ def run_refine():
 def main():
     global bitaxe_ip, initial_voltage, initial_frequency, benchmark_time
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
-    global max_temp, system_reset_done
+    global max_temp, system_reset_done, voltage_increment, frequency_increment
 
     args = parse_arguments()
     if not args.bitaxe_ip:
@@ -847,6 +1010,12 @@ def main():
     resume_enabled = args.resume
     if args.benchmark_time is not None:
         benchmark_time = args.benchmark_time
+    if args.voltage_step is not None:
+        voltage_increment = args.voltage_step
+    if args.frequency_step is not None:
+        frequency_increment = args.frequency_step
+    if voltage_increment <= 0 or frequency_increment <= 0:
+        raise ValueError(RED + "Error: --voltage-step and --frequency-step must be positive." + RESET)
 
     total_samples = benchmark_time // sample_interval
     if total_samples - warmup_samples < 8:
@@ -860,8 +1029,8 @@ def main():
     fetch_default_settings()
 
     # Resolve start voltage/frequency. Grid keeps the upstream 1150/500 start;
-    # refine starts from the device's current settings unless overridden.
-    if benchmark_mode == "refine":
+    # refine and efficiency start from the device's current settings unless overridden.
+    if benchmark_mode in ("refine", "efficiency"):
         initial_frequency = args.frequency if args.frequency is not None else default_frequency
         initial_voltage = args.voltage if args.voltage is not None else default_voltage
     else:
@@ -875,6 +1044,18 @@ def main():
         raise ValueError(RED + f"Error: Initial frequency {initial_frequency}MHz outside allowed range "
                                f"{min_allowed_frequency}-{max_allowed_frequency}MHz." + RESET)
 
+    if args.dry_run:
+        print(GREEN + "Dry run — resolved plan (no device changes will be made):" + RESET)
+        print(f"  Device:     {bitaxe_ip}")
+        print(f"  Mode:       {benchmark_mode}")
+        print(f"  Start:      {initial_voltage}mV / {initial_frequency}MHz")
+        print(f"  Steps:      {voltage_increment}mV voltage, {frequency_increment}MHz frequency")
+        print(f"  Ceilings:   {max_error_rate:.1f}% error, {max_temp}°C chip")
+        print(f"  Window:     {benchmark_time}s ({benchmark_time // sample_interval} samples, "
+              f"{warmup_samples} warmup)")
+        print(f"  Error gate: {'on' if error_gate_enabled else 'off'}")
+        return
+
     if resume_enabled:
         load_existing_results()
 
@@ -885,14 +1066,18 @@ def main():
     print("\nNOTE: Ambient temperature significantly affects these results. The optimal settings found may not")
     print("work well if room temperature changes substantially. Re-run the benchmark if conditions change.\n")
 
+    exit_code = 0
     try:
         if benchmark_mode == "refine":
             run_refine()
+        elif benchmark_mode == "efficiency":
+            run_efficiency()
         else:
             run_grid()
     except Exception as e:
         # Let the finally block own restoration so the device is only reset once.
         print(RED + f"An unexpected error occurred: {e}" + RESET)
+        exit_code = 1
     finally:
         if not system_reset_done:
             if results:
@@ -901,7 +1086,7 @@ def main():
                 print(GREEN + "Bitaxe reset to best or default settings and results saved." + RESET)
             else:
                 print(YELLOW + "No valid benchmarking results found. Applying predefined default settings." + RESET)
-                set_system_settings(default_voltage, default_frequency)
+                set_system_settings(default_voltage, default_frequency, skip_wait=True)
             system_reset_done = True
 
         if results:
@@ -909,6 +1094,9 @@ def main():
             save_final_json()
             print(GREEN + "\nBenchmarking completed." + RESET)
             print_summary()
+
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
