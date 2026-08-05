@@ -18,6 +18,17 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 
 Everything is a backward-compatible superset: an existing invocation behaves as before, now with the error rate also shown.
 
+## Which mode should I use?
+
+| Your situation | Use | What it does |
+|---|---|---|
+| Just want a quick health snapshot — **no changes** | `--check` | Measures the current setting once (no reboot) and reports error / J-TH / temp |
+| Fresh chip, or you want the full voltage×frequency picture | `--mode grid` (default) | Full sweep; picks the most efficient setting under the error ceiling |
+| Miner is **erroring / unstable** and you want it fixed | `--mode refine` | Sweeps voltage up (and drops frequency if it overheats) until the error clears |
+| Miner is **already healthy** and you want less power/heat | `--mode efficiency` | Holds the frequency and trims voltage down to the leanest setting that still passes |
+
+`refine` and `efficiency` start from the device's **current** setting; `grid` starts from a conservative default and climbs. Every mode auto-restores the best setting it found (or your original) on exit, including Ctrl+C.
+
 ## Prerequisites
 
 - Python 3.11 or higher
@@ -77,6 +88,12 @@ Optional parameters:
 - `--benchmark-time <s>`: override the per-combo window in seconds (default: 600)
 - `--voltage-step <mV>` / `--frequency-step <MHz>`: sweep increments (defaults: 20 / 25)
 - `--dry-run`: print the resolved plan and exit without touching the device
+- `--check`: read-only — measure the current setting once (no changes, no reboot) and report
+
+Quick health check (no changes to the miner):
+```bash
+python bitaxe_hashrate_benchmark.py 192.168.2.29 --check
+```
 
 Trim a healthy miner for efficiency (hold frequency, lower voltage while it still passes):
 ```bash

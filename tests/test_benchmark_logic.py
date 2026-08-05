@@ -300,5 +300,34 @@ class TestRefineControlFlow(unittest.TestCase):
         self.assertEqual(outcome, "passed")
 
 
+class TestCheckMode(unittest.TestCase):
+    """--check must measure the current setting without applying or rebooting."""
+
+    def setUp(self):
+        self._saved = (b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval,
+                       b.default_voltage, b.default_frequency, b.error_gate_enabled, b.max_error_rate)
+        b.small_core_count = 2040
+        b.asic_count = 1
+        b.benchmark_time = 20
+        b.sample_interval = 1
+        b.default_voltage = 1150
+        b.default_frequency = 525
+        b.error_gate_enabled = True
+        b.max_error_rate = 3.5
+
+    def tearDown(self):
+        (b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval,
+         b.default_voltage, b.default_frequency, b.error_gate_enabled, b.max_error_rate) = self._saved
+
+    def test_check_is_read_only(self):
+        with mock.patch.object(b, "get_system_info", return_value=make_info()), \
+             mock.patch.object(b.time, "sleep", return_value=None), \
+             mock.patch.object(b, "set_system_settings") as ss, \
+             mock.patch.object(b, "restart_system") as rs:
+            b.run_check()
+        ss.assert_not_called()   # nothing applied
+        rs.assert_not_called()   # no reboot
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

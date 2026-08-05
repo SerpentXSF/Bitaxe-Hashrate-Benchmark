@@ -79,6 +79,8 @@ def parse_arguments():
                         help='Frequency increment in MHz (default: 25)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print the resolved plan and exit without touching the device')
+    parser.add_argument('--check', action='store_true',
+                        help='Read-only: measure the current setting once (no changes, no reboot) and report')
     parser.add_argument('--max-error', type=float, default=3.5,
                         help='Error-rate ceiling in percent for selecting the best setting (default: 3.5)')
     parser.add_argument('--max-temp', type=int, default=66,
@@ -988,6 +990,42 @@ def run_efficiency():
             break
 
 
+def run_check():
+    """Read-only health snapshot: measure the CURRENT setting over one window
+    without changing voltage/frequency or rebooting. Nothing is applied or
+    restored — the device keeps running exactly as it was."""
+    voltage, frequency = default_voltage, default_frequency
+    print(GREEN + f"Health check: measuring the current setting {voltage}mV / {frequency}MHz "
+                  f"over ~{benchmark_time}s — no changes, no reboot." + RESET)
+    r = benchmark_iteration(voltage, frequency)
+    if not r["ok"]:
+        print(RED + f"Check could not complete ({r['reason']})." + RESET)
+        return
+    er = f"{r['errorRate']:.2f}%" if r["errorRate"] is not None else "n/a"
+    gate = ("PASS" if passes_error_gate(r["errorRate"], max_error_rate) else "OVER CEILING") \
+        if r["errorRate"] is not None else "no error data"
+    vr = f"   VR: {r['averageVRTemp']:.1f}°C" if r["averageVRTemp"] is not None else ""
+    print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz\n"
+                  f"  Hashrate:   {r['averageHashRate']:.1f} GH/s\n"
+                  f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
+                  f"  Error:      {er} [{gate} @ {max_error_rate:.1f}%]\n"
+                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}" + RESET)
+
+
+def print_run_expectations():
+    """Set expectations before a sweep: reboots, mining downtime, rough duration."""
+    per_combo_min = (sleep_time + benchmark_time) / 60.0
+    ranges = {
+        "grid": "many combos — often 30 min to a few hours",
+        "refine": f"a handful of combos (more if it must drop frequency) — roughly {per_combo_min*3:.0f}-{per_combo_min*12:.0f} min",
+        "efficiency": f"a few combos — roughly {per_combo_min*2:.0f}-{per_combo_min*6:.0f} min",
+    }
+    print(YELLOW + "Before you start:" + RESET)
+    print(f"  - Each combo reboots the miner and runs ~{per_combo_min:.0f} min; mining is interrupted for the whole run.")
+    print(f"  - This '{benchmark_mode}' run tests {ranges.get(benchmark_mode, 'several combos')}.")
+    print("  - You can stop anytime with Ctrl+C — it restores the best setting found so far.\n")
+
+
 # --------------------------------------------------------------------------- #
 # Entry point                                                                 #
 # --------------------------------------------------------------------------- #
@@ -1010,6 +1048,8 @@ def main():
     resume_enabled = args.resume
     if args.benchmark_time is not None:
         benchmark_time = args.benchmark_time
+    elif args.check:
+        benchmark_time = 240   # a health check is quicker than a full 10-min window
     if args.voltage_step is not None:
         voltage_increment = args.voltage_step
     if args.frequency_step is not None:
@@ -1027,6 +1067,11 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
 
     fetch_default_settings()
+
+    # Read-only health check: measure the current setting and exit, no sweep.
+    if args.check:
+        run_check()
+        return
 
     # Resolve start voltage/frequency. Grid keeps the upstream 1150/500 start;
     # refine and efficiency start from the device's current settings unless overridden.
@@ -1065,6 +1110,8 @@ def main():
     print("Use this tool at your own risk. The author(s) are not responsible for any damage to your hardware.")
     print("\nNOTE: Ambient temperature significantly affects these results. The optimal settings found may not")
     print("work well if room temperature changes substantially. Re-run the benchmark if conditions change.\n")
+
+    print_run_expectations()
 
     exit_code = 0
     try:
