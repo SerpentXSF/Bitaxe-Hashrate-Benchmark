@@ -7,7 +7,7 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 ## What this fork adds
 
 - **Error-rate measurement**: a trimmed mean of `errorPercentage` over each combo's stable window (with `std`/`min`/`max` recorded), plus the raw ASIC error count for the window (`errorCountDelta`).
-- **Error gate, then efficiency**: the best setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%), not the raw fastest. It falls back to the lowest-error setting when nothing clears the ceiling.
+- **Error gate, then efficiency**: the best setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%) with hashrate in tolerance, not the raw fastest. When nothing clears the ceiling it falls back to the best of the rest, preferring in-tolerance hashrate and a full (non-early-aborted) window, then lowest error.
 - **`refine` mode**: rescue an unstable ASIC. It sweeps voltage up to the lowest setting that clears the ceiling, then probes down for a lower-voltage setting that still passes (better J/TH). If the chip hits the temperature ceiling before the error clears, it lowers the frequency and retries, since frequency is the effective lever once cooling is the limit. Combinations that clearly can't clear the ceiling are stopped early (and still recorded) to save time.
 - **`efficiency` mode**: for a healthy miner. It holds the frequency and lowers voltage from the current setting to the lowest voltage that still clears the ceiling, cutting power and heat with no loss of hashrate.
 - **Robustness**: settings are read back and confirmed after each apply, so a failed PATCH or watchdog reboot can't mislabel a result. A dropped request retries once instead of ending the run. The gate uses a light trimmed mean and records the spread (`std`/`min`/`max`) so one noisy sample won't flip a borderline result.
@@ -27,7 +27,7 @@ Existing commands work exactly as before; the error rate is now also reported.
 | Miner is erroring or unstable and you want it fixed | `--mode refine` | Sweeps voltage up (and lowers frequency if it overheats) until the error clears |
 | Miner is already healthy and you want less power/heat | `--mode efficiency` | Holds the frequency and trims voltage down to the leanest setting that still passes |
 
-`refine` and `efficiency` start from the device's current setting; `grid` starts from a conservative default and climbs. Every mode restores the best setting it found (or your original) on exit, including on Ctrl+C.
+`refine` and `efficiency` start from the device's current setting; `grid` starts from a conservative default and climbs. Every mode restores the best setting it found (or the setting the device started with) on exit, including on Ctrl+C.
 
 ## Prerequisites
 
@@ -140,7 +140,7 @@ How step 4 differs by mode:
 - **efficiency**: hold the frequency and sweep voltage down from the current setting to the lowest voltage that still clears the ceiling.
 - **--check**: measure the current setting once and report; no changes, no reboot.
 
-The miner reboots between combos and mining is interrupted for the whole run. The tool restores the best setting it found (or your original) on exit and on Ctrl+C, and skips the 90s stabilization wait on that final restore.
+The miner reboots between combos and mining is interrupted for the whole run. The tool restores the best setting it found (or the setting the device started with) on exit and on Ctrl+C, and skips the 90s stabilization wait on that final restore.
 
 ## Configuration
 

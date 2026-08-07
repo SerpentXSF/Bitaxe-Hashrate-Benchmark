@@ -46,7 +46,9 @@ and never disqualifies a combination.
 A combination passes the gate when its error rate is unknown or at or below
 `--max-error` (default 3.5%). The best setting is the lowest J/TH among passers
 that also held hashrate in tolerance, with ties broken by higher hashrate. If no
-combination passes, the tool falls back to the lowest-error result. The reported
+combination passes, the tool falls back to the best of the remaining results,
+preferring in-tolerance hashrate and a full (non-early-aborted) window, then
+lowest error, then efficiency. The reported
 rankings include top-by-hashrate, top-by-J/TH, and top-by-lowest-error, each
 flagged pass/fail.
 
@@ -75,7 +77,9 @@ watchdog reboot into different settings can't mislabel a result. A dropped
 request retries once instead of ending the run. `--resume` reloads the most
 recent results file for the IP (matched by glob so it survives an hour boundary)
 and replays the recorded pass/fail branch for already-tested combinations. The
-best setting (or the original) is restored on exit and on Ctrl+C.
+best setting (or the device's starting settings, when nothing was measured) is
+restored on exit and on Ctrl+C, and the tool reports a warning rather than
+claiming success if that restore request fails.
 
 ## Output
 

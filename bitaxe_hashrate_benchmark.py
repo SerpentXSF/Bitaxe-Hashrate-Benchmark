@@ -8,7 +8,7 @@ import sys
 import argparse
 from datetime import datetime
 
-START_TIME = datetime.now().strftime("%Y-%m-%d_%H")
+START_TIME = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
 # ANSI Color Codes
 GREEN = "\033[92m"
@@ -195,8 +195,14 @@ def select_best(all_results, ceiling, gate_enabled=True):
     def in_tolerance(r):
         return r.get('hashrateWithinTolerance', True)
 
+    def gate_ok(r):
+        # Recompute from the raw error rate and the active ceiling rather than the
+        # persisted passedErrorGate, so a resume with a different --max-error (or a
+        # legacy file that predates the field) still decides correctly.
+        return passes_error_gate(r.get('errorRate'), ceiling)
+
     if gate_enabled:
-        passers = [r for r in all_results if r.get('passedErrorGate') and in_tolerance(r)]
+        passers = [r for r in all_results if gate_ok(r) and in_tolerance(r)]
     else:
         passers = [r for r in all_results if in_tolerance(r)]
 
@@ -287,11 +293,15 @@ def handle_sigint(signum, frame):
 
     try:
         if results:
-            reset_to_best_setting()
+            restored = reset_to_best_setting()
             save_results()
-            print(GREEN + "Bitaxe reset to best or default settings and results saved." + RESET)
+            if restored:
+                print(GREEN + "Bitaxe reset to best or starting settings and results saved." + RESET)
+            else:
+                print(RED + "WARNING: could not confirm the restore - the miner may still be on the last "
+                            "test settings. Check it and reapply your preferred setting." + RESET)
         else:
-            print(YELLOW + "No valid benchmarking results found. Applying predefined default settings." + RESET)
+            print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
             set_system_settings(default_voltage, default_frequency)
     finally:
         system_reset_done = True
@@ -318,6 +328,9 @@ def get_system_info():
 
 
 def set_system_settings(core_voltage, frequency, skip_wait=False):
+    """Apply settings and restart. Returns True only if both HTTP requests
+    succeeded, so callers can report a failed restore instead of assuming it
+    worked."""
     settings = {
         "coreVoltage": core_voltage,
         "frequency": frequency
@@ -327,12 +340,14 @@ def set_system_settings(core_voltage, frequency, skip_wait=False):
         response.raise_for_status()
         print(YELLOW + f"Applying settings: Voltage = {core_voltage}mV, Frequency = {frequency}MHz" + RESET)
         time.sleep(2)
-        restart_system(skip_wait=skip_wait)
+        return restart_system(skip_wait=skip_wait)
     except requests.exceptions.RequestException as e:
         print(RED + f"Error setting system settings: {e}" + RESET)
+        return False
 
 
 def restart_system(skip_wait=False):
+    """Restart the device. Returns True on success, False if the request failed."""
     try:
         # Wait for stabilization before benchmarking, but not on an interrupt or a
         # final restore (skip_wait) - nothing is measured after those, so the 90 s
@@ -346,8 +361,10 @@ def restart_system(skip_wait=False):
             response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
             response.raise_for_status()
             time.sleep(sleep_time)
+        return True
     except requests.exceptions.RequestException as e:
         print(RED + f"Error restarting the system: {e}" + RESET)
+        return False
 
 
 def apply_settings(core_voltage, frequency):
@@ -683,24 +700,26 @@ def save_csv():
 
 
 def reset_to_best_setting():
+    """Apply the best (or starting) setting. Returns True only if the apply/restart
+    requests succeeded, so the caller doesn't claim success on a failed restore."""
     best_result = select_best(results, max_error_rate, error_gate_enabled)
     if best_result is None:
-        print(YELLOW + "No valid benchmarking results found. Applying predefined default settings." + RESET)
-        set_system_settings(default_voltage, default_frequency, skip_wait=True)
-    else:
-        best_voltage = best_result["coreVoltage"]
-        best_frequency = best_result["frequency"]
-        er = best_result.get("errorRate")
-        er_str = f"{er:.2f}%" if er is not None else "n/a"
-        if error_gate_enabled and not best_result.get("passedErrorGate"):
-            print(YELLOW + "Warning: no setting stayed within the error ceiling; "
-                           "applying the lowest-error result found." + RESET)
-        print(GREEN + f"Applying the best settings from benchmarking:\n"
-                      f"  Core Voltage: {best_voltage}mV\n"
-                      f"  Frequency: {best_frequency}MHz\n"
-                      f"  Efficiency: {best_result['efficiencyJTH']:.2f} J/TH | Error: {er_str}" + RESET)
-        set_system_settings(best_voltage, best_frequency, skip_wait=True)
+        print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
+        return set_system_settings(default_voltage, default_frequency, skip_wait=True)
+
+    best_voltage = best_result["coreVoltage"]
+    best_frequency = best_result["frequency"]
+    er = best_result.get("errorRate")
+    er_str = f"{er:.2f}%" if er is not None else "n/a"
+    if error_gate_enabled and not passes_error_gate(er, max_error_rate):
+        print(YELLOW + "Warning: no setting stayed within the error ceiling; "
+                       "applying the lowest-error result found." + RESET)
+    print(GREEN + f"Applying the best settings from benchmarking:\n"
+                  f"  Core Voltage: {best_voltage}mV\n"
+                  f"  Frequency: {best_frequency}MHz\n"
+                  f"  Efficiency: {best_result['efficiencyJTH']:.2f} J/TH | Error: {er_str}" + RESET)
     # set_system_settings already restarts; no extra reboot needed here.
+    return set_system_settings(best_voltage, best_frequency, skip_wait=True)
 
 
 def _fmt_row(r):
@@ -809,7 +828,9 @@ def run_combo(voltage, frequency):
 
 
 def combo_passes(res):
-    gate_ok = (not error_gate_enabled) or res.get("passedErrorGate")
+    # Recompute against the active ceiling (see select_best) rather than trusting a
+    # persisted passedErrorGate, which may be stale on a resume.
+    gate_ok = (not error_gate_enabled) or passes_error_gate(res.get("errorRate"), max_error_rate)
     return gate_ok and res.get("hashrateWithinTolerance", True)
 
 
@@ -853,14 +874,12 @@ def run_grid():
                 else:
                     break
         elif reason in THERMAL_REASONS:
-            # Thermally capped: retreat frequency and add voltage, like an unstable combo.
-            if current_voltage + voltage_increment <= max_allowed_voltage:
-                current_voltage += voltage_increment
-                current_frequency -= frequency_increment
-                print(YELLOW + f"Thermally capped ({reason}). Decreasing frequency to {current_frequency}MHz "
-                               f"and increasing voltage to {current_voltage}mV" + RESET)
-            else:
-                break
+            # Thermally capped. Lower frequencies at this voltage were already tested
+            # on the way up, and adding voltage here would only add heat, so stop.
+            # Use --mode refine to push a thermally-limited chip.
+            print(GREEN + f"Thermally capped ({reason}) at {current_voltage}mV / {current_frequency}MHz; "
+                          f"stopping the sweep. Use --mode refine for a thermally-limited chip." + RESET)
+            break
         else:
             print(GREEN + f"Stopping further testing ({reason or 'stability limit'})." + RESET)
             break
@@ -983,6 +1002,9 @@ def run_efficiency():
     voltage -= voltage_increment
     while voltage >= min_allowed_voltage:
         if resume_enabled and already_tested(voltage, frequency):
+            rec = _recorded(voltage, frequency)
+            if rec is not None and not combo_passes(rec):
+                break  # recorded failure here; the leanest passer is above this
             voltage -= voltage_increment
             continue
         res, _ = run_combo(voltage, frequency)
@@ -1139,12 +1161,20 @@ def main():
     finally:
         if not system_reset_done:
             if results:
-                reset_to_best_setting()
+                restored = reset_to_best_setting()
                 save_results()
-                print(GREEN + "Bitaxe reset to best or default settings and results saved." + RESET)
+                if restored:
+                    print(GREEN + "Bitaxe reset to best or starting settings and results saved." + RESET)
+                else:
+                    print(RED + "WARNING: could not confirm the restore - the miner may still be on the last "
+                                "test settings. Check it and reapply your preferred setting." + RESET)
             else:
-                print(YELLOW + "No valid benchmarking results found. Applying predefined default settings." + RESET)
+                # No results at all means the run never got a usable measurement
+                # (e.g. settings wouldn't apply or the device was unreachable):
+                # restore and flag it as a failure for automation.
+                print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
                 set_system_settings(default_voltage, default_frequency, skip_wait=True)
+                exit_code = 1
             system_reset_done = True
 
         if results:

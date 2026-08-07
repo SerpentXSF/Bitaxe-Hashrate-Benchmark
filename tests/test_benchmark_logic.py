@@ -148,6 +148,27 @@ class TestSelectBest(unittest.TestCase):
         best = b.select_best([throttled, healthy], 3.5, gate_enabled=True)
         self.assertEqual(best["coreVoltage"], 1150)
 
+    def test_recomputes_gate_ignoring_stale_flag(self):
+        # A resumed record can carry a stale passedErrorGate. Selection must
+        # recompute from errorRate + the active ceiling, not trust the flag.
+        stale = {"coreVoltage": 1050, "frequency": 575, "averageHashRate": 1250,
+                 "efficiencyJTH": 13.5, "errorRate": 9.0, "passedErrorGate": True,
+                 "hashrateWithinTolerance": True}
+        real = {"coreVoltage": 1150, "frequency": 575, "averageHashRate": 1180,
+                "efficiencyJTH": 15.0, "errorRate": 2.0, "passedErrorGate": True,
+                "hashrateWithinTolerance": True}
+        best = b.select_best([stale, real], 3.5, gate_enabled=True)
+        self.assertEqual(best["coreVoltage"], 1150)   # 9% rejected despite the flag
+
+    def test_legacy_result_without_flag_is_gated_by_error_rate(self):
+        # A file predating passedErrorGate must still be gated by errorRate.
+        legacy_pass = {"coreVoltage": 1150, "frequency": 575, "averageHashRate": 1180,
+                       "efficiencyJTH": 15.0, "errorRate": 2.0, "hashrateWithinTolerance": True}
+        legacy_fail = {"coreVoltage": 1050, "frequency": 575, "averageHashRate": 1250,
+                       "efficiencyJTH": 13.0, "errorRate": 8.0, "hashrateWithinTolerance": True}
+        best = b.select_best([legacy_pass, legacy_fail], 3.5, gate_enabled=True)
+        self.assertEqual(best["coreVoltage"], 1150)
+
     def test_empty_returns_none(self):
         self.assertIsNone(b.select_best([], 3.5))
 
@@ -245,6 +266,54 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertFalse(r["earlyAborted"])
         self.assertTrue(b.passes_error_gate(r["errorRate"], 3.5))
+
+
+class TestComboPasses(unittest.TestCase):
+    def setUp(self):
+        self._saved = (b.error_gate_enabled, b.max_error_rate)
+        b.error_gate_enabled = True
+        b.max_error_rate = 3.5
+
+    def tearDown(self):
+        (b.error_gate_enabled, b.max_error_rate) = self._saved
+
+    def test_recomputes_from_error_rate_not_stale_flag(self):
+        over = {"errorRate": 9.0, "passedErrorGate": True, "hashrateWithinTolerance": True}
+        self.assertFalse(b.combo_passes(over))          # flag says pass, error says no
+        good = {"errorRate": 2.0, "passedErrorGate": False, "hashrateWithinTolerance": True}
+        self.assertTrue(b.combo_passes(good))           # flag says fail, error says yes
+
+
+class TestEfficiencyResume(unittest.TestCase):
+    """Efficiency resume must stop at a recorded failing voltage, not skip past it."""
+
+    def setUp(self):
+        self._saved = (b.initial_voltage, b.initial_frequency, b.resume_enabled, b.results,
+                       b.error_gate_enabled, b.max_error_rate, b.voltage_increment)
+        b.initial_voltage = 1150
+        b.initial_frequency = 600
+        b.resume_enabled = True
+        b.error_gate_enabled = True
+        b.max_error_rate = 3.5
+        b.voltage_increment = 20
+
+    def tearDown(self):
+        (b.initial_voltage, b.initial_frequency, b.resume_enabled, b.results,
+         b.error_gate_enabled, b.max_error_rate, b.voltage_increment) = self._saved
+
+    @staticmethod
+    def _rec(cv, er):
+        return {"coreVoltage": cv, "frequency": 600, "averageHashRate": 1200,
+                "efficiencyJTH": 15.0, "errorRate": er, "passedErrorGate": er <= 3.5,
+                "hashrateWithinTolerance": True}
+
+    def test_stops_at_recorded_failure(self):
+        # Start (1150) passed, the next voltage down (1130) failed: must stop there,
+        # not probe below a known failure. Everything is recorded, so no run_combo.
+        b.results = [self._rec(1150, 2.0), self._rec(1130, 9.0)]
+        with mock.patch.object(b, "run_combo") as rc:
+            b.run_efficiency()
+        rc.assert_not_called()
 
 
 class TestRefineControlFlow(unittest.TestCase):
