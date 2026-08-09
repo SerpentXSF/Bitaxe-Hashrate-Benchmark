@@ -759,7 +759,7 @@ def load_existing_results():
     if not matches:
         print(YELLOW + "Resume: no prior results file found for this IP; starting fresh." + RESET)
         return
-    latest = matches[-1]  # %Y-%m-%d_%H timestamps sort chronologically
+    latest = matches[-1]  # %Y-%m-%d_%H%M%S timestamps sort chronologically
     try:
         with open(latest, "r") as f:
             data = json.load(f)

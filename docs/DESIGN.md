@@ -56,7 +56,10 @@ flagged pass/fail.
 
 - `grid` (default): the full sweep, now error-aware. A combination that fails the
   gate is treated like an unstable result (raise voltage, step frequency back)
-  instead of climbing; a thermally-capped combination retreats the same way.
+  instead of climbing; on a temperature/power cutoff it stops the sweep, since
+  the passing combos found on the way up are already recorded and adding voltage
+  there would only add heat (refine is the mode for pushing a thermally-limited
+  chip).
 - `refine`: stabilize a single ASIC. Start at the device's current (or `-v`/`-f`)
   setting and sweep voltage up to the first setting that passes the gate with
   in-tolerance hashrate, then probe down for a lower-voltage passer. If the chip

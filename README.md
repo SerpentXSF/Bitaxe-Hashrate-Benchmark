@@ -167,7 +167,7 @@ Every combination runs the same measured cycle:
 
 How step 4 differs by mode:
 
-- **grid**: start conservative (default 1150mV / 500MHz) and climb. If the combo is stable and under the ceiling, raise frequency; if it's unstable or over the ceiling, step frequency back and raise voltage. On a temperature/power cutoff it stops, since the lower frequencies at that voltage were already tested on the way up (use refine for a thermally-limited chip). Stops at the voltage/frequency limits.
+- **grid**: start conservative (default 1150mV / 500MHz) and climb. If the combo is stable and under the ceiling, raise frequency; if it's unstable or over the ceiling, step frequency back and raise voltage. On a temperature/power cutoff it stops (the passing combos found on the way up are already recorded, and adding voltage there would only add heat; use refine for a thermally-limited chip). Stops at the voltage/frequency limits.
 - **refine**: hold the frequency and sweep voltage up to the first setting that clears the ceiling, then probe down for a leaner one. If the chip hits the temperature ceiling before the error clears, lower the frequency and retry.
 - **efficiency**: hold the frequency and sweep voltage down from the current setting to the lowest voltage that still clears the ceiling.
 - **--check**: measure the current setting once and report; no changes, no reboot.
