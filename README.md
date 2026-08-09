@@ -7,7 +7,7 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 ## What this fork adds
 
 - **Error-rate measurement**: a trimmed mean of `errorPercentage` over each combo's stable window (with `std`/`min`/`max` recorded), plus the raw ASIC error count for the window (`errorCountDelta`).
-- **More telemetry per combo**: hashrate standard deviation (how steady the combo is, not just its average), and fan speed (`%` and RPM) — a useful cooling axis alongside temperature.
+- **More telemetry per combo**: hashrate standard deviation (how steady the combo is, not just its average), and fan speed (`%` and RPM), a useful cooling axis alongside temperature.
 - **Error gate, then efficiency**: the best setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%) with hashrate in tolerance, not the raw fastest. When nothing clears the ceiling it falls back to the best of the rest, preferring in-tolerance hashrate and a full (non-early-aborted) window, then lowest error.
 - **`refine` mode**: rescue an unstable ASIC. It sweeps voltage up to the lowest setting that clears the ceiling, then probes down for a lower-voltage setting that still passes (better J/TH). If the chip hits the temperature ceiling before the error clears, it lowers the frequency and retries, since frequency is the effective lever once cooling is the limit. Combinations that clearly can't clear the ceiling are stopped early (and still recorded) to save time.
 - **`efficiency` mode**: for a healthy miner. It holds the frequency and lowers voltage from the current setting to the lowest voltage that still clears the ceiling, cutting power and heat with no loss of hashrate.
@@ -29,6 +29,19 @@ Existing commands work exactly as before; the error rate is now also reported.
 | Miner is already healthy and you want less power/heat | `--mode efficiency` | Holds the frequency and trims voltage down to the leanest setting that still passes |
 
 `refine` and `efficiency` start from the device's current setting; `grid` starts from a conservative default and climbs. Every mode restores the best setting it found (or the setting the device started with) on exit, including on Ctrl+C.
+
+## Real-world results
+
+Validated on a small fleet of BM1370 Gamma miners. The error-aware selection and thermal-aware refine consistently cut the ASIC hardware error rate while keeping efficiency in range:
+
+| Miner | Error before | Error after | What refine did |
+|---|---|---|---|
+| A | ~6.9% | **1.5%** | lowered frequency one step (525 -> 500 MHz) |
+| B | ~4.7% | **2.6%** | lowered frequency one step (600 -> 575 MHz) |
+| C | ~9% | **~3.3%** | walked frequency down on its own (680 -> 555 MHz) |
+| D | ~2% | ~1.6% | already healthy; confirmed and left unchanged |
+
+The fan and steady-state temperature data also made a hardware problem obvious: two units ran 69-70 C even at reduced clocks with the fan pegged at 100%, which is degraded cooling (thermal paste, fan, or airflow), not something tuning can fix. On thermally-marginal miners a short benchmark window can settle just under `--max-temp` while true steady-state runs 1-2 C higher, so use a stricter `--max-temp` (for example 66) to leave headroom.
 
 ## Prerequisites
 
@@ -146,7 +159,7 @@ Anything after `--run` is passed straight through to `bitaxe_hashrate_benchmark.
 
 Every combination runs the same measured cycle:
 
-1. **Apply and verify**: set the voltage/frequency and reboot, then monitor the device for up to 90s while it stabilizes — a combo already over the temperature/power limit is dropped here before the window is wasted — and read the settings back to confirm the device actually took them (a failed apply or watchdog reboot won't mislabel a result).
+1. **Apply and verify**: set the voltage/frequency and reboot, then monitor the device for up to 90s while it stabilizes (a combo already over the temperature/power limit is dropped here before the window is wasted), and read the settings back to confirm the device actually took them (a failed apply or watchdog reboot won't mislabel a result).
 2. **Measure**: sample every 15s over the window (default 10 min). Transient post-reboot readings (sensors not ready yet) are skipped rather than aborting the combo.
 3. **Reduce**: average hashrate (dropping 3 high + 3 low outliers) with its standard deviation, temperature, VR temperature, power and fan speed (excluding the warmup samples), compute J/TH, and derive the error rate as a trimmed mean of `errorPercentage` over the stable window. A combo that clearly can't reach the error ceiling is stopped early but still recorded.
 4. **Decide the next combo** (per mode, below).
@@ -204,14 +217,15 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
 
 ## Safety Features
 
-- Automatic temperature monitoring with configurable safety cutoff (66°C chip temp default)
+- Automatic temperature monitoring with configurable safety cutoff (66°C chip temp default), enforced both during sampling and during the post-apply stabilization window
 - Voltage regulator (VR) temperature monitoring with safety cutoff (86°C)
 - Input voltage monitoring with minimum threshold (4800mV) and maximum threshold (5500mV)
 - Power consumption monitoring with safety cutoff (40W)
 - Transient warmup readings (temp/voltage/hashrate not ready after a reboot) are skipped, not treated as failures
+- Implausible hashrate readings (far above the theoretical maximum, seen on unstable chips) are skipped so they can't pollute the average or the rankings
 - Graceful shutdown on interruption (Ctrl+C)
-- Automatic reset to best performing settings after benchmarking
-- Input validation for safe voltage and frequency ranges
+- Automatic reset to the best (or starting) settings after benchmarking, with a warning if the restore request fails
+- Input validation for safe voltage and frequency ranges (positive sweep steps required)
 - Hashrate validation to ensure stability
 - Protection against invalid system data
 - Outlier removal from benchmark results
@@ -227,11 +241,12 @@ python -m pytest tests/
 ## Data Processing
 
 The tool implements several data processing techniques to ensure accurate results:
-- Removes 3 highest and 3 lowest hashrate readings to eliminate outliers (when enough samples exist)
-- Excludes warmup readings (chronologically) when averaging temperature, power, and error rate
+- Removes 3 highest and 3 lowest hashrate readings to eliminate outliers (when enough samples exist), and skips readings far above the theoretical maximum
+- Records the standard deviation of the trimmed hashrate as a steadiness signal
+- Excludes warmup readings (chronologically) when averaging temperature, power, fan speed, and error rate
 - Validates hashrate is within 6% of theoretical maximum
 - Averages power consumption over the post-warmup window (the same window as hashrate/error, so J/TH is comparable across settings)
-- Monitors VR temperature when available
+- Monitors VR temperature and fan speed when available
 - Calculates efficiency in Joules per Terahash (J/TH)
 
 ## Credits
