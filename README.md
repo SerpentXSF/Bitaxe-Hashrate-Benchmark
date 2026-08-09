@@ -124,6 +124,24 @@ Example:
 docker run --rm bitaxe-benchmark 192.168.2.26 -v 1200 -f 550
 ```
 
+## Fleet helper (`fleet.py`)
+
+For running more than one miner, `fleet.py` is a small companion script (it shells out to the benchmark, so the main tool stays a single file).
+
+Status snapshot (read-only) of several miners at once:
+```bash
+python fleet.py 192.168.2.10 192.168.2.11 192.168.2.12
+python fleet.py --file miners.txt        # one IP per line, # comments allowed
+```
+It prints a table of hashrate, error, temp, VR temp, fan, J/TH and uptime per miner.
+
+Run the benchmark across the whole fleet, one miner at a time, then show the resulting state:
+```bash
+python fleet.py --file miners.txt --run "--check --max-temp 68"
+python fleet.py 192.168.2.10 192.168.2.11 --run "--mode refine --max-temp 68 --benchmark-time 300"
+```
+Anything after `--run` is passed straight through to `bitaxe_hashrate_benchmark.py`.
+
 ## Benchmarking process
 
 Every combination runs the same measured cycle:
