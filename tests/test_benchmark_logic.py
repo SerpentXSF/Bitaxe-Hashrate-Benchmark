@@ -412,6 +412,28 @@ class TestCheckMode(unittest.TestCase):
         finally:
             (b.check_mode, b.handling_interrupt, b.system_reset_done) = saved
 
+    def test_sigint_no_results_failed_restore_warns(self):
+        # No results + a failed restore must warn, not exit silently claiming success.
+        import io, contextlib
+        saved = (b.check_mode, b.handling_interrupt, b.system_reset_done, b.results,
+                 b.default_voltage, b.default_frequency)
+        b.check_mode = False
+        b.handling_interrupt = False
+        b.system_reset_done = False
+        b.results = []
+        b.default_voltage = 1150
+        b.default_frequency = 525
+        try:
+            buf = io.StringIO()
+            with mock.patch.object(b, "set_system_settings", return_value=False):
+                with contextlib.redirect_stdout(buf):
+                    with self.assertRaises(SystemExit):
+                        b.handle_sigint(2, None)
+            self.assertIn("could not confirm the restore", buf.getvalue())
+        finally:
+            (b.check_mode, b.handling_interrupt, b.system_reset_done, b.results,
+             b.default_voltage, b.default_frequency) = saved
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -57,6 +57,10 @@ results_basename_override = None   # set by --resume to keep writing the same fi
 # Abort reasons that mean "too hot / too much power": lower frequency, don't add voltage
 THERMAL_REASONS = ("CHIP_TEMP_EXCEEDED", "VR_TEMP_EXCEEDED", "POWER_CONSUMPTION_EXCEEDED")
 
+# Printed when a restore request fails, so success is never claimed falsely.
+RESTORE_FAIL_WARNING = ("WARNING: could not confirm the restore - the miner may still be on the last "
+                        "test settings. Check it and reapply your preferred setting.")
+
 # State flags
 handling_interrupt = False
 system_reset_done = False
@@ -298,11 +302,11 @@ def handle_sigint(signum, frame):
             if restored:
                 print(GREEN + "Bitaxe reset to best or starting settings and results saved." + RESET)
             else:
-                print(RED + "WARNING: could not confirm the restore - the miner may still be on the last "
-                            "test settings. Check it and reapply your preferred setting." + RESET)
+                print(RED + RESTORE_FAIL_WARNING + RESET)
         else:
             print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
-            set_system_settings(default_voltage, default_frequency)
+            if not set_system_settings(default_voltage, default_frequency):
+                print(RED + RESTORE_FAIL_WARNING + RESET)
     finally:
         system_reset_done = True
         handling_interrupt = False
@@ -1166,14 +1170,14 @@ def main():
                 if restored:
                     print(GREEN + "Bitaxe reset to best or starting settings and results saved." + RESET)
                 else:
-                    print(RED + "WARNING: could not confirm the restore - the miner may still be on the last "
-                                "test settings. Check it and reapply your preferred setting." + RESET)
+                    print(RED + RESTORE_FAIL_WARNING + RESET)
             else:
                 # No results at all means the run never got a usable measurement
                 # (e.g. settings wouldn't apply or the device was unreachable):
                 # restore and flag it as a failure for automation.
                 print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
-                set_system_settings(default_voltage, default_frequency, skip_wait=True)
+                if not set_system_settings(default_voltage, default_frequency, skip_wait=True):
+                    print(RED + RESTORE_FAIL_WARNING + RESET)
                 exit_code = 1
             system_reset_done = True
 
