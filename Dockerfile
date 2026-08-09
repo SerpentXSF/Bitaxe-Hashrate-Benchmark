@@ -1,6 +1,9 @@
 # Use Python 3.11 slim image as base
 FROM python:3.11-slim
 
+# Stream stdout/stderr without buffering so `docker logs -f` shows live progress
+ENV PYTHONUNBUFFERED=1
+
 # Set working directory
 WORKDIR /app
 

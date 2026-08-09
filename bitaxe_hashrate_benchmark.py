@@ -3,6 +3,7 @@ import time
 import json
 import csv
 import glob
+import os
 import signal
 import sys
 import argparse
@@ -148,6 +149,15 @@ def compute_window_error(samples):
     return (sum(eps) / len(eps), 'errorPercentage-mean')
 
 
+def stddev(values):
+    """Sample standard deviation of a list of numbers (0.0 for fewer than 2)."""
+    n = len(values)
+    if n < 2:
+        return 0.0
+    mean = sum(values) / n
+    return (sum((x - mean) ** 2 for x in values) / (n - 1)) ** 0.5
+
+
 def window_error_stats(samples):
     """Dispersion of a window's error readings: sample std / min / max / count.
 
@@ -156,10 +166,7 @@ def window_error_stats(samples):
     eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
     if not eps:
         return None
-    n = len(eps)
-    mean = sum(eps) / n
-    std = (sum((x - mean) ** 2 for x in eps) / (n - 1)) ** 0.5 if n >= 2 else 0.0
-    return {"std": std, "min": min(eps), "max": max(eps), "n": n}
+    return {"std": stddev(eps), "min": min(eps), "max": max(eps), "n": len(eps)}
 
 
 def window_error_count(samples):
@@ -331,10 +338,12 @@ def get_system_info():
     return None
 
 
-def set_system_settings(core_voltage, frequency, skip_wait=False):
+def set_system_settings(core_voltage, frequency):
     """Apply settings and restart. Returns True only if both HTTP requests
     succeeded, so callers can report a failed restore instead of assuming it
-    worked."""
+    worked. The post-apply stabilization wait is handled by
+    monitored_stabilization() for combos being benchmarked; restores don't wait
+    (nothing is measured after them)."""
     settings = {
         "coreVoltage": core_voltage,
         "frequency": frequency
@@ -344,50 +353,90 @@ def set_system_settings(core_voltage, frequency, skip_wait=False):
         response.raise_for_status()
         print(YELLOW + f"Applying settings: Voltage = {core_voltage}mV, Frequency = {frequency}MHz" + RESET)
         time.sleep(2)
-        return restart_system(skip_wait=skip_wait)
+        return restart_system()
     except requests.exceptions.RequestException as e:
         print(RED + f"Error setting system settings: {e}" + RESET)
         return False
 
 
-def restart_system(skip_wait=False):
+def restart_system():
     """Restart the device. Returns True on success, False if the request failed."""
     try:
-        # Wait for stabilization before benchmarking, but not on an interrupt or a
-        # final restore (skip_wait) - nothing is measured after those, so the 90 s
-        # sleep would just delay exit.
-        if handling_interrupt or skip_wait:
-            print(YELLOW + "Applying final settings..." + RESET)
-            response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
-            response.raise_for_status()
-        else:
-            print(YELLOW + f"Applying new settings and waiting {sleep_time}s for system stabilization..." + RESET)
-            response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
-            response.raise_for_status()
-            time.sleep(sleep_time)
+        response = requests.post(f"{bitaxe_ip}/api/system/restart", timeout=10)
+        response.raise_for_status()
         return True
     except requests.exceptions.RequestException as e:
         print(RED + f"Error restarting the system: {e}" + RESET)
         return False
 
 
-def apply_settings(core_voltage, frequency):
-    """Apply settings, restart, and confirm the device actually took them.
+def _quick_info():
+    """One quick GET of /api/system/info; None on any error (the device may be
+    mid-reboot). Used for lightweight polling that shouldn't spam retries."""
+    try:
+        r = requests.get(f"{bitaxe_ip}/api/system/info", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException:
+        return None
 
-    A silently-failed PATCH or a watchdog reboot into different settings would
-    otherwise make benchmark_iteration measure the wrong configuration and
-    record it under the requested one. Retries once, then gives up. Returns
-    True only when the device reports back the requested voltage/frequency."""
+
+def monitored_stabilization():
+    """Wait up to sleep_time for the device to settle after applying a combo,
+    polling for over-limit conditions. Returns a THERMAL_REASONS value if a limit
+    is exceeded during the wait - so the caller can treat the combo as thermally
+    capped without wasting the whole sample window - or None once the wait
+    completes with no violation."""
+    print(YELLOW + f"Applying new settings and monitoring for up to {sleep_time}s "
+                   f"for system stabilization..." + RESET)
+    poll = 5
+    waited = 0
+    while waited < sleep_time:
+        time.sleep(poll)
+        waited += poll
+        info = _quick_info()
+        if not info:
+            continue  # still rebooting
+        temp = info.get("temp")
+        vr = info.get("vrTemp")
+        power = info.get("power")
+        if temp is not None and temp >= max_temp:
+            print(RED + f"Chip temperature {temp:.1f}°C hit the {max_temp}°C limit during stabilization; "
+                        f"aborting this combo." + RESET)
+            return "CHIP_TEMP_EXCEEDED"
+        if vr is not None and vr >= max_vr_temp:
+            print(RED + f"VR temperature {vr:.1f}°C hit the {max_vr_temp}°C limit during stabilization; "
+                        f"aborting this combo." + RESET)
+            return "VR_TEMP_EXCEEDED"
+        if power is not None and power > max_power:
+            print(RED + f"Power {power:.1f}W exceeded {max_power}W during stabilization; "
+                        f"aborting this combo." + RESET)
+            return "POWER_CONSUMPTION_EXCEEDED"
+    return None
+
+
+def apply_settings(core_voltage, frequency):
+    """Apply settings, restart, monitor the stabilization window, and confirm the
+    device took the settings.
+
+    Returns (True, None) on success, or (False, reason). `reason` is a
+    THERMAL_REASONS value when a limit is breached while the device settles (so a
+    bad combo is dropped before the sample window is wasted), or 'APPLY_FAILED'
+    when a silently-failed PATCH or a watchdog reboot leaves the device on the
+    wrong voltage/frequency (which would otherwise mislabel the measurement)."""
     for attempt in range(2):
         set_system_settings(core_voltage, frequency)
+        reason = monitored_stabilization()
+        if reason is not None:
+            return False, reason
         info = get_system_info()
         if info and info.get("coreVoltage") == core_voltage and info.get("frequency") == frequency:
-            return True
+            return True, None
         got_v = info.get("coreVoltage") if info else "?"
         got_f = info.get("frequency") if info else "?"
         print(YELLOW + f"Applied settings not confirmed (attempt {attempt + 1}/2): requested "
                        f"{core_voltage}mV/{frequency}MHz, device reports {got_v}mV/{got_f}MHz." + RESET)
-    return False
+    return False, "APPLY_FAILED"
 
 
 def _iter_result(ok=False, reason=None, **kw):
@@ -405,6 +454,9 @@ def _iter_result(ok=False, reason=None, **kw):
         "errorRate": None,
         "errorCountDelta": None,
         "errorStats": None,
+        "hashrateStd": None,
+        "averageFanSpeed": None,
+        "averageFanRpm": None,
         "earlyAborted": False,
     }
     r.update(kw)
@@ -428,7 +480,8 @@ def _warn_no_error_data():
 
 
 def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
-                     error_samples, expected_hashrate, early=False):
+                     error_samples, expected_hashrate, fan_speeds=None, fan_rpms=None,
+                     early=False):
     """Turn a window's collected samples into a result dict. Called both at
     end-of-window and on an early abort - so a marginal device that never clears
     the ceiling still leaves a recorded (partial) floor for select_best."""
@@ -436,10 +489,12 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         print(YELLOW + "No Hashrate or Temperature or Watts data collected." + RESET)
         return _iter_fail("NO_DATA_COLLECTED")
 
-    # Hashrate: drop 3 high + 3 low as outliers when there is enough data.
+    # Hashrate: drop 3 high + 3 low as outliers when there is enough data. Its
+    # standard deviation over that trimmed set measures how steady the combo is.
     sorted_hashrates = sorted(hash_rates)
     trimmed_hashrates = sorted_hashrates[3:-3] if len(sorted_hashrates) > 6 else sorted_hashrates
     average_hashrate = sum(trimmed_hashrates) / len(trimmed_hashrates)
+    hashrate_std = stddev(trimmed_hashrates)
 
     # Temp/VR/power: drop the warmup samples chronologically (the first N), not by
     # value - clipping the lowest readings anywhere would bias the average high.
@@ -454,6 +509,15 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     trimmed_power = power_consumptions[warmup_samples:] if len(power_consumptions) > warmup_samples else power_consumptions
     average_power = sum(trimmed_power) / len(trimmed_power)
 
+    def _avg_post_warmup(values):
+        if not values:
+            return None
+        window = values[warmup_samples:] if len(values) > warmup_samples else values
+        return sum(window) / len(window) if window else None
+
+    average_fan_speed = _avg_post_warmup(fan_speeds or [])
+    average_fan_rpm = _avg_post_warmup(fan_rpms or [])
+
     if average_hashrate <= 0:
         print(RED + "Warning: Zero hashrate detected, skipping efficiency calculation" + RESET)
         return _iter_fail("ZERO_HASHRATE")
@@ -467,10 +531,14 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     hashrate_within_tolerance = (average_hashrate >= expected_hashrate * 0.94)
 
     tag = " [early]" if early else ""
-    print(GREEN + f"Average Hashrate{tag}: {average_hashrate:.2f} GH/s (Expected: {expected_hashrate:.2f} GH/s)" + RESET)
+    print(GREEN + f"Average Hashrate{tag}: {average_hashrate:.2f} GH/s (±{hashrate_std:.1f}, "
+                  f"Expected: {expected_hashrate:.2f} GH/s)" + RESET)
     print(GREEN + f"Average Temperature: {average_temperature:.2f}°C" + RESET)
     if average_vr_temp is not None:
         print(GREEN + f"Average VR Temperature: {average_vr_temp:.2f}°C" + RESET)
+    if average_fan_speed is not None:
+        rpm = f" ({average_fan_rpm:.0f} RPM)" if average_fan_rpm is not None else ""
+        print(GREEN + f"Average Fan: {average_fan_speed:.0f}%{rpm}" + RESET)
     print(GREEN + f"Efficiency: {efficiency_jth:.2f} J/TH" + RESET)
     if error_rate is not None:
         gate_note = "PASS" if passes_error_gate(error_rate, max_error_rate) else "OVER CEILING"
@@ -493,6 +561,9 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         errorRate=error_rate,
         errorCountDelta=error_count_delta,
         errorStats=error_stats,
+        hashrateStd=hashrate_std,
+        averageFanSpeed=average_fan_speed,
+        averageFanRpm=average_fan_rpm,
         earlyAborted=early,
     )
 
@@ -505,6 +576,8 @@ def benchmark_iteration(core_voltage, frequency):
     power_consumptions = []
     vr_temps = []
     error_samples = []
+    fan_speeds = []
+    fan_rpms = []
     total_samples = benchmark_time // sample_interval
     expected_hashrate = frequency * ((small_core_count * asic_count) / 1000)
 
@@ -551,6 +624,17 @@ def benchmark_iteration(core_voltage, frequency):
                 time.sleep(sample_interval)
             continue
 
+        # Unstable/undervolted chips can report a garbage hashrate far above the
+        # theoretical maximum. Skip such samples so they don't pollute the average
+        # or the rankings (a combo that only reports garbage ends up NO_DATA; a
+        # genuine zero still flows through to the ZERO_HASHRATE path below).
+        if expected_hashrate > 0 and hash_rate > expected_hashrate * 2:
+            print(YELLOW + f"Implausible hashrate reading ({int(hash_rate)} GH/s vs expected "
+                           f"{int(expected_hashrate)}); skipping sample." + RESET)
+            if sample < total_samples - 1:
+                time.sleep(sample_interval)
+            continue
+
         if power_consumption > max_power:
             print(RED + f"Power consumption exceeded {max_power}W! Stopping current benchmark." + RESET)
             return _iter_fail("POWER_CONSUMPTION_EXCEEDED")
@@ -564,6 +648,12 @@ def benchmark_iteration(core_voltage, frequency):
             "error_count": sum_error_count(info),
             "error_percentage": info.get("errorPercentage"),
         })
+        fan_speed = info.get("fanspeed")
+        fan_rpm = info.get("fanrpm")
+        if fan_speed is not None:
+            fan_speeds.append(fan_speed)
+        if fan_rpm is not None:
+            fan_rpms.append(fan_rpm)
 
         percentage_progress = ((sample + 1) / total_samples) * 100
         status_line = (
@@ -580,6 +670,8 @@ def benchmark_iteration(core_voltage, frequency):
         er_now = info.get("errorPercentage")
         if er_now is not None:
             status_line += f" | E: {er_now:4.1f}%"
+        if fan_rpm is not None:
+            status_line += f" | Fan: {int(fan_rpm)}rpm"
         print(status_line + RESET)
 
         # Early abort: if even a perfect (0%) remainder can't pull the window mean
@@ -598,22 +690,26 @@ def benchmark_iteration(core_voltage, frequency):
                     print(RED + f"Error ceiling unreachable (best-case trimmed mean {best_case_mean:.1f}% > "
                                 f"{max_error_rate:.1f}%); aborting combo early." + RESET)
                     return _finalize_window(hash_rates, temperatures, power_consumptions,
-                                            vr_temps, error_samples, expected_hashrate, early=True)
+                                            vr_temps, error_samples, expected_hashrate,
+                                            fan_speeds, fan_rpms, early=True)
 
         if sample < total_samples - 1:
             time.sleep(sample_interval)
 
     return _finalize_window(hash_rates, temperatures, power_consumptions,
-                            vr_temps, error_samples, expected_hashrate, early=False)
+                            vr_temps, error_samples, expected_hashrate,
+                            fan_speeds, fan_rpms, early=False)
 
 
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
                   avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
-                  error_stats=None, early_aborted=False):
+                  error_stats=None, early_aborted=False, hashrate_std=None,
+                  fan_speed=None, fan_rpm=None):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
         "averageHashRate": avg_hashrate,
+        "hashrateStd": hashrate_std,
         "averageTemperature": avg_temp,
         "efficiencyJTH": efficiency_jth,
         "errorRate": error_rate,
@@ -628,6 +724,10 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         result["errorRateMax"] = error_stats.get("max")
     if avg_vr_temp is not None:
         result["averageVRTemp"] = avg_vr_temp
+    if fan_speed is not None:
+        result["averageFanSpeed"] = fan_speed
+    if fan_rpm is not None:
+        result["averageFanRpm"] = fan_rpm
     results.append(result)
     return result
 
@@ -689,10 +789,10 @@ def save_csv():
         return
     try:
         filename = results_filename("csv")
-        fields = ["coreVoltage", "frequency", "averageHashRate", "efficiencyJTH",
+        fields = ["coreVoltage", "frequency", "averageHashRate", "hashrateStd", "efficiencyJTH",
                   "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate",
                   "hashrateWithinTolerance", "earlyAborted",
-                  "averageTemperature", "averageVRTemp"]
+                  "averageTemperature", "averageVRTemp", "averageFanSpeed", "averageFanRpm"]
         with open(filename, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
@@ -709,7 +809,7 @@ def reset_to_best_setting():
     best_result = select_best(results, max_error_rate, error_gate_enabled)
     if best_result is None:
         print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
-        return set_system_settings(default_voltage, default_frequency, skip_wait=True)
+        return set_system_settings(default_voltage, default_frequency)
 
     best_voltage = best_result["coreVoltage"]
     best_frequency = best_result["frequency"]
@@ -723,7 +823,7 @@ def reset_to_best_setting():
                   f"  Frequency: {best_frequency}MHz\n"
                   f"  Efficiency: {best_result['efficiencyJTH']:.2f} J/TH | Error: {er_str}" + RESET)
     # set_system_settings already restarts; no extra reboot needed here.
-    return set_system_settings(best_voltage, best_frequency, skip_wait=True)
+    return set_system_settings(best_voltage, best_frequency)
 
 
 def _fmt_row(r):
@@ -773,7 +873,10 @@ def save_final_json():
             "coreVoltage": r["coreVoltage"],
             "frequency": r["frequency"],
             "averageHashRate": r["averageHashRate"],
+            "hashrateStd": r.get("hashrateStd"),
             "averageTemperature": r["averageTemperature"],
+            "averageFanSpeed": r.get("averageFanSpeed"),
+            "averageFanRpm": r.get("averageFanRpm"),
             "efficiencyJTH": r["efficiencyJTH"],
             "errorRate": r.get("errorRate"),
             "errorRateStd": r.get("errorRateStd"),
@@ -814,14 +917,19 @@ def run_combo(voltage, frequency):
     hiccup doesn't end a multi-hour sweep. Returns (recorded_result_or_None,
     error_reason). Records the result (with hashrate tolerance) on success."""
     for attempt in range(2):
-        if not apply_settings(voltage, frequency):
-            return None, "APPLY_FAILED"
+        applied, apply_reason = apply_settings(voltage, frequency)
+        if not applied:
+            # apply_reason may be a THERMAL_REASONS value (over-limit during the
+            # stabilization wait), which the caller treats like a thermal cap.
+            return None, apply_reason or "APPLY_FAILED"
         r = benchmark_iteration(voltage, frequency)
         if r["ok"]:
             res = record_result(voltage, frequency, r["averageHashRate"], r["averageTemperature"],
                                 r["efficiencyJTH"], r["averageVRTemp"], r["errorRate"],
                                 r["errorCountDelta"], r["hashrateWithinTolerance"],
-                                error_stats=r["errorStats"], early_aborted=r["earlyAborted"])
+                                error_stats=r["errorStats"], early_aborted=r["earlyAborted"],
+                                hashrate_std=r["hashrateStd"], fan_speed=r["averageFanSpeed"],
+                                fan_rpm=r["averageFanRpm"])
             save_results()
             return res, r["reason"]
         if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
@@ -1039,11 +1147,16 @@ def run_check():
         if r["errorRate"] is not None else "no error data"
     vr = f"   VR: {r['averageVRTemp']:.1f}°C" if r["averageVRTemp"] is not None else ""
     partial = "   (partial window - error cut it short)" if r["earlyAborted"] else ""
+    hstd = f" (±{r['hashrateStd']:.1f})" if r["hashrateStd"] is not None else ""
+    fan = ""
+    if r["averageFanSpeed"] is not None:
+        rpm = f", {r['averageFanRpm']:.0f} RPM" if r["averageFanRpm"] is not None else ""
+        fan = f"\n  Fan:        {r['averageFanSpeed']:.0f}%{rpm}"
     print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz{partial}\n"
-                  f"  Hashrate:   {r['averageHashRate']:.1f} GH/s\n"
+                  f"  Hashrate:   {r['averageHashRate']:.1f} GH/s{hstd}\n"
                   f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
                   f"  Error:      {er} [{gate} @ {max_error_rate:.1f}%]\n"
-                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}" + RESET)
+                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}{fan}" + RESET)
     return True
 
 
@@ -1069,6 +1182,11 @@ def main():
     global bitaxe_ip, initial_voltage, initial_frequency, benchmark_time
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
     global max_temp, system_reset_done, voltage_increment, frequency_increment, check_mode
+
+    # On Windows, this call turns on ANSI escape processing so the colored output
+    # renders in the classic console (Windows Terminal already supports it).
+    if os.name == "nt":
+        os.system("")
 
     args = parse_arguments()
     if not args.bitaxe_ip:
@@ -1176,7 +1294,7 @@ def main():
                 # (e.g. settings wouldn't apply or the device was unreachable):
                 # restore and flag it as a failure for automation.
                 print(YELLOW + "No valid benchmarking results found. Restoring the device's starting settings." + RESET)
-                if not set_system_settings(default_voltage, default_frequency, skip_wait=True):
+                if not set_system_settings(default_voltage, default_frequency):
                     print(RED + RESTORE_FAIL_WARNING + RESET)
                 exit_code = 1
             system_reset_done = True

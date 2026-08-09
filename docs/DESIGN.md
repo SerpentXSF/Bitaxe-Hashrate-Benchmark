@@ -73,7 +73,10 @@ flagged pass/fail.
 ## Robustness
 
 Settings are read back and confirmed after each apply, so a failed PATCH or a
-watchdog reboot into different settings can't mislabel a result. A dropped
+watchdog reboot into different settings can't mislabel a result. The device is
+polled during the post-apply stabilization window; a combo already over the
+temperature or power limit is dropped there (surfaced as a thermal reason, which
+refine uses to lower frequency) rather than wasting the sample window. A dropped
 request retries once instead of ending the run. `--resume` reloads the most
 recent results file for the IP (matched by glob so it survives an hour boundary)
 and replays the recorded pass/fail branch for already-tested combinations. The
@@ -84,9 +87,9 @@ claiming success if that restore request fails.
 ## Output
 
 The JSON keeps the upstream shape and adds `errorRate`, `errorRateStd`,
-`errorCountDelta`, `passedErrorGate`, `hashrateWithinTolerance`, and
-`earlyAborted` per result. A CSV and a ranked console summary are written
-alongside it.
+`errorCountDelta`, `passedErrorGate`, `hashrateWithinTolerance`, `earlyAborted`,
+`hashrateStd`, and fan telemetry (`averageFanSpeed`, `averageFanRpm`) per result.
+A CSV and a ranked console summary are written alongside it.
 
 ## Compatibility
 

@@ -7,10 +7,11 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 ## What this fork adds
 
 - **Error-rate measurement**: a trimmed mean of `errorPercentage` over each combo's stable window (with `std`/`min`/`max` recorded), plus the raw ASIC error count for the window (`errorCountDelta`).
+- **More telemetry per combo**: hashrate standard deviation (how steady the combo is, not just its average), and fan speed (`%` and RPM) — a useful cooling axis alongside temperature.
 - **Error gate, then efficiency**: the best setting is the lowest J/TH among combinations that stay within the error ceiling (`--max-error`, default 3.5%) with hashrate in tolerance, not the raw fastest. When nothing clears the ceiling it falls back to the best of the rest, preferring in-tolerance hashrate and a full (non-early-aborted) window, then lowest error.
 - **`refine` mode**: rescue an unstable ASIC. It sweeps voltage up to the lowest setting that clears the ceiling, then probes down for a lower-voltage setting that still passes (better J/TH). If the chip hits the temperature ceiling before the error clears, it lowers the frequency and retries, since frequency is the effective lever once cooling is the limit. Combinations that clearly can't clear the ceiling are stopped early (and still recorded) to save time.
 - **`efficiency` mode**: for a healthy miner. It holds the frequency and lowers voltage from the current setting to the lowest voltage that still clears the ceiling, cutting power and heat with no loss of hashrate.
-- **Robustness**: settings are read back and confirmed after each apply, so a failed PATCH or watchdog reboot can't mislabel a result. A dropped request retries once instead of ending the run. The gate uses a light trimmed mean and records the spread (`std`/`min`/`max`) so one noisy sample won't flip a borderline result.
+- **Robustness**: settings are read back and confirmed after each apply, so a failed PATCH or watchdog reboot can't mislabel a result. During the post-apply stabilization wait the device is monitored, so a combo that is already over the temperature/power limit is dropped before the sample window is wasted (and refine treats it as a reason to lower frequency). A dropped request retries once instead of ending the run. The gate uses a light trimmed mean and records the spread (`std`/`min`/`max`) so one noisy sample won't flip a borderline result.
 - **Configurable chip-temp cutoff** (`--max-temp`): BM1370/Gamma boards often idle near 65°C and need 68 to leave room to raise voltage.
 - **CSV export and a ranked summary** (highest hashrate, most efficient, lowest error) alongside the existing JSON.
 - **Resume** (`--resume`): reload prior results for an IP and skip already-tested combinations.
@@ -127,15 +128,15 @@ docker run --rm bitaxe-benchmark 192.168.2.26 -v 1200 -f 550
 
 Every combination runs the same measured cycle:
 
-1. **Apply and verify**: set the voltage/frequency, reboot, wait 90s to stabilize, then read the settings back to confirm the device actually took them (a failed apply or watchdog reboot won't mislabel a result).
+1. **Apply and verify**: set the voltage/frequency and reboot, then monitor the device for up to 90s while it stabilizes — a combo already over the temperature/power limit is dropped here before the window is wasted — and read the settings back to confirm the device actually took them (a failed apply or watchdog reboot won't mislabel a result).
 2. **Measure**: sample every 15s over the window (default 10 min). Transient post-reboot readings (sensors not ready yet) are skipped rather than aborting the combo.
-3. **Reduce**: average hashrate (dropping 3 high + 3 low outliers), temperature, VR temperature and power (excluding the warmup samples), compute J/TH, and derive the error rate as a trimmed mean of `errorPercentage` over the stable window. A combo that clearly can't reach the error ceiling is stopped early but still recorded.
+3. **Reduce**: average hashrate (dropping 3 high + 3 low outliers) with its standard deviation, temperature, VR temperature, power and fan speed (excluding the warmup samples), compute J/TH, and derive the error rate as a trimmed mean of `errorPercentage` over the stable window. A combo that clearly can't reach the error ceiling is stopped early but still recorded.
 4. **Decide the next combo** (per mode, below).
 5. **Select and apply**: once the sweep ends, pick the most efficient (lowest J/TH) setting that stayed under the error ceiling with in-tolerance hashrate; if nothing qualifies, fall back to the lowest-error setting. Apply it, save JSON + CSV, and print the ranked summary.
 
 How step 4 differs by mode:
 
-- **grid**: start conservative (default 1150mV / 500MHz) and climb. If the combo is stable and under the ceiling, raise frequency; if it's unstable, over the ceiling, or thermally capped, step frequency back and raise voltage. Stops at the voltage/frequency limits.
+- **grid**: start conservative (default 1150mV / 500MHz) and climb. If the combo is stable and under the ceiling, raise frequency; if it's unstable or over the ceiling, step frequency back and raise voltage. On a temperature/power cutoff it stops, since the lower frequencies at that voltage were already tested on the way up (use refine for a thermally-limited chip). Stops at the voltage/frequency limits.
 - **refine**: hold the frequency and sweep voltage up to the first setting that clears the ceiling, then probe down for a leaner one. If the chip hits the temperature ceiling before the error clears, lower the frequency and retry.
 - **efficiency**: hold the frequency and sweep voltage down from the current setting to the lowest voltage that still clears the ceiling.
 - **--check**: measure the current setting once and report; no changes, no reboot.
@@ -173,9 +174,10 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
 - Complete test results for all combinations
 - Top 5 by hashrate, top 5 by efficiency (J/TH), and top 5 by lowest error rate
 - For each configuration:
-  - Average hashrate (with outlier removal)
+  - Average hashrate (with outlier removal) and its standard deviation (`hashrateStd`)
   - Temperature readings (excluding initial warmup period)
   - VR temperature readings (when available)
+  - Fan speed (`averageFanSpeed` %, `averageFanRpm` RPM) when the device reports it
   - Power efficiency metrics (J/TH)
   - Error rate (`errorRate`) with its dispersion (`errorRateStd`) and raw hardware errors over the window (`errorCountDelta`)
   - Whether it stayed within the error ceiling (`passedErrorGate`) and held hashrate in tolerance (`hashrateWithinTolerance`)

@@ -13,11 +13,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import bitaxe_hashrate_benchmark as b
 
 
-def make_info(temp=55, hr=1200, power=18, vr=60, ep=2.0, ec=1000, voltage=5000):
+def make_info(temp=55, hr=1200, power=18, vr=60, ep=2.0, ec=1000, voltage=5000,
+              fanspeed=80, fanrpm=5000):
     return {
         "temp": temp, "vrTemp": vr, "voltage": voltage,
         "hashRate": hr, "power": power, "errorPercentage": ep,
         "hashrateMonitor": {"asics": [{"errorCount": ec}]},
+        "fanspeed": fanspeed, "fanrpm": fanrpm,
     }
 
 
@@ -232,6 +234,12 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         self.assertIsNotNone(r["errorRate"])
         self.assertFalse(r["earlyAborted"])
 
+    def test_success_captures_fan_and_hashrate_std(self):
+        r = self._run(make_info(fanspeed=80, fanrpm=5000))
+        self.assertEqual(r["averageFanSpeed"], 80)
+        self.assertEqual(r["averageFanRpm"], 5000)
+        self.assertIsNotNone(r["hashrateStd"])   # 0.0 for a flat feed, but present
+
     def test_thermal_guard(self):
         r = self._run(make_info(temp=99))
         self.assertFalse(r["ok"])
@@ -247,6 +255,21 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         r = self._run(seq)
         self.assertTrue(r["ok"])
         self.assertIsNotNone(r["averageHashRate"])
+
+    def test_garbage_hashrate_samples_are_skipped(self):
+        # A couple of absurd hashrate spikes must not inflate the average.
+        # expected ~ 525 * 2040/1000 = 1071 GH/s; 99999 is far above 2x.
+        seq = [make_info(hr=99999) for _ in range(2)] + [make_info(hr=1050) for _ in range(20)]
+        r = self._run(seq)
+        self.assertTrue(r["ok"])
+        self.assertLess(r["averageHashRate"], 2000)   # garbage excluded, ~1050
+
+    def test_all_garbage_hashrate_is_no_data(self):
+        with mock.patch.object(b, "get_system_info", return_value=make_info(hr=99999)), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            r = b.benchmark_iteration(1150, 525)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "NO_DATA_COLLECTED")
 
     def test_unreachable_error_records_early_floor(self):
         # Sustained error over the ceiling -> abort early, but still a recorded
@@ -433,6 +456,54 @@ class TestCheckMode(unittest.TestCase):
         finally:
             (b.check_mode, b.handling_interrupt, b.system_reset_done, b.results,
              b.default_voltage, b.default_frequency) = saved
+
+
+class TestStddev(unittest.TestCase):
+    def test_zero_for_fewer_than_two(self):
+        self.assertEqual(b.stddev([]), 0.0)
+        self.assertEqual(b.stddev([5.0]), 0.0)
+
+    def test_flat_series_is_zero(self):
+        self.assertEqual(b.stddev([10.0, 10.0, 10.0]), 0.0)
+
+    def test_known_value(self):
+        # sample std of [2,4,4,4,5,5,7,9] is 2.138...
+        self.assertAlmostEqual(b.stddev([2, 4, 4, 4, 5, 5, 7, 9]), 2.13808993, places=6)
+
+
+class TestMonitoredStabilization(unittest.TestCase):
+    """The pre-sample settle window should abort a combo already over-limit."""
+
+    def setUp(self):
+        self._saved = (b.sleep_time, b.max_temp, b.max_vr_temp, b.max_power)
+        b.sleep_time = 15
+        b.max_temp = 68
+        b.max_vr_temp = 86
+        b.max_power = 40
+
+    def tearDown(self):
+        (b.sleep_time, b.max_temp, b.max_vr_temp, b.max_power) = self._saved
+
+    def test_aborts_on_over_temp(self):
+        with mock.patch.object(b, "_quick_info", return_value=make_info(temp=99)), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            self.assertEqual(b.monitored_stabilization(), "CHIP_TEMP_EXCEEDED")
+
+    def test_aborts_on_over_power(self):
+        with mock.patch.object(b, "_quick_info", return_value=make_info(power=45)), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            self.assertEqual(b.monitored_stabilization(), "POWER_CONSUMPTION_EXCEEDED")
+
+    def test_completes_when_within_limits(self):
+        with mock.patch.object(b, "_quick_info", return_value=make_info(temp=55)), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            self.assertIsNone(b.monitored_stabilization())
+
+    def test_keeps_waiting_while_device_rebooting(self):
+        # _quick_info returns None (device down) the whole time -> completes cleanly.
+        with mock.patch.object(b, "_quick_info", return_value=None), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            self.assertIsNone(b.monitored_stabilization())
 
 
 if __name__ == "__main__":
