@@ -506,5 +506,74 @@ class TestMonitoredStabilization(unittest.TestCase):
             self.assertIsNone(b.monitored_stabilization())
 
 
+class TestThermalMargin(unittest.TestCase):
+    def setUp(self):
+        self._saved = (b.max_temp, b.thermal_margin, b.max_vr_temp, b.vr_margin,
+                       b.error_gate_enabled, b.max_error_rate)
+        b.max_temp = 66
+        b.thermal_margin = 1.5
+        b.max_vr_temp = 86
+        b.vr_margin = 4
+        b.error_gate_enabled = True
+        b.max_error_rate = 3.5
+
+    def tearDown(self):
+        (b.max_temp, b.thermal_margin, b.max_vr_temp, b.vr_margin,
+         b.error_gate_enabled, b.max_error_rate) = self._saved
+
+    def test_passes_with_headroom(self):
+        self.assertTrue(b.passes_thermal({"averageTemperature": 63}, 66, 1.5, 86, 4))
+
+    def test_fails_over_chip_margin(self):
+        self.assertFalse(b.passes_thermal({"averageTemperature": 65}, 66, 1.5, 86, 4))  # > 64.5
+
+    def test_fails_over_vr_margin(self):
+        self.assertFalse(b.passes_thermal({"averageTemperature": 50, "averageVRTemp": 83}, 66, 1.5, 86, 4))
+
+    def test_missing_temp_passes(self):
+        self.assertTrue(b.passes_thermal({}, 66, 1.5, 86, 4))
+
+    def test_select_best_excludes_hot_passer(self):
+        hot = {"coreVoltage": 1200, "frequency": 600, "averageHashRate": 1250, "efficiencyJTH": 13.0,
+               "errorRate": 2.0, "passedErrorGate": True, "hashrateWithinTolerance": True,
+               "averageTemperature": 65.5}
+        cool = {"coreVoltage": 1150, "frequency": 575, "averageHashRate": 1180, "efficiencyJTH": 15.0,
+                "errorRate": 2.5, "passedErrorGate": True, "hashrateWithinTolerance": True,
+                "averageTemperature": 60}
+        best = b.select_best([hot, cool], 3.5, gate_enabled=True)
+        self.assertEqual(best["coreVoltage"], 1150)  # hot excluded despite best J/TH
+
+    def test_combo_passes_requires_headroom(self):
+        self.assertFalse(b.combo_passes({"errorRate": 2.0, "hashrateWithinTolerance": True,
+                                         "averageTemperature": 65.5}))
+        self.assertTrue(b.combo_passes({"errorRate": 2.0, "hashrateWithinTolerance": True,
+                                        "averageTemperature": 60}))
+
+
+class TestTempSlope(unittest.TestCase):
+    def test_flat_is_zero(self):
+        self.assertAlmostEqual(b.temp_slope_per_min([50, 50, 50, 50, 50], 15), 0.0)
+
+    def test_rising_is_positive(self):
+        # +1C per 15s sample -> +4C/min
+        self.assertAlmostEqual(b.temp_slope_per_min([50, 51, 52, 53, 54], 15), 4.0, places=6)
+
+    def test_too_few_is_none(self):
+        self.assertIsNone(b.temp_slope_per_min([50, 51], 15))
+
+
+class TestCoolingLimited(unittest.TestCase):
+    def test_pinned_and_pegged(self):
+        rs = [{"averageFanSpeed": 100, "averageTemperature": 65},
+              {"averageFanSpeed": 100, "averageTemperature": 66}]
+        self.assertTrue(b.cooling_limited(rs, 66))
+
+    def test_cool_is_not_limited(self):
+        self.assertFalse(b.cooling_limited([{"averageFanSpeed": 80, "averageTemperature": 50}], 66))
+
+    def test_no_fan_data_is_false(self):
+        self.assertFalse(b.cooling_limited([{"averageTemperature": 65}], 66))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -32,18 +32,44 @@ class TestStatusRow(unittest.TestCase):
         self.assertIn("Gamma", row)
         self.assertIn("600/1140", row)
         self.assertIn("100%/8194", row)
+        self.assertIn("[!err !temp !cooling]", row)   # erroring, hot, and fan pegged
 
-    def test_missing_fan_shows_na(self):
+    def test_missing_fields_show_na_not_zero(self):
+        # An unreadable errorPercentage must not render as a healthy 0.0%.
         info = {"hostname": "X", "frequency": 500, "coreVoltage": 1150,
-                "hashRate": 1000, "errorPercentage": 2.0, "temp": 50, "vrTemp": 55,
-                "power": 18, "uptimeSeconds": 600}
-        self.assertIn("n/a", fleet.status_row("10.0.0.3", info))
+                "hashRate": 1000, "temp": 50, "power": 18, "uptimeSeconds": 600}
+        row = fleet.status_row("10.0.0.3", info)
+        self.assertIn("n/a", row)          # missing err/vr/fan -> n/a
+        self.assertNotIn("[!", row)        # nothing flagged
 
 
-class TestLoadIps(unittest.TestCase):
-    def test_dedupes_preserving_order(self):
+class TestRowFlags(unittest.TestCase):
+    def test_healthy_no_flags(self):
+        self.assertEqual(fleet.row_flags({"errorPercentage": 2.0, "temp": 50, "fanspeed": 60}), [])
+
+    def test_pegged_fan_but_cool_is_not_flagged(self):
+        # Many Gammas run the fan at 100% always; cool + pegged is normal.
+        self.assertEqual(fleet.row_flags({"errorPercentage": 2.0, "temp": 46, "fanspeed": 100}), [])
+
+    def test_flags_error_hot_and_cooling(self):
+        self.assertEqual(
+            fleet.row_flags({"errorPercentage": 9.0, "temp": 70, "fanspeed": 100}),
+            ["err", "temp", "cooling"])
+
+
+class TestLoadTargets(unittest.TestCase):
+    def test_positional_dedupe(self):
         args = types.SimpleNamespace(ips=["a", "b", "a", "c"], file=None)
-        self.assertEqual(fleet.load_ips(args), ["a", "b", "c"])
+        self.assertEqual(fleet.load_targets(args), [("a", []), ("b", []), ("c", [])])
+
+
+class TestDelta(unittest.TestCase):
+    def test_before_after(self):
+        before = {"errorPercentage": 6.9, "frequency": 525, "coreVoltage": 1100}
+        after = {"errorPercentage": 1.5, "frequency": 500, "coreVoltage": 1120}
+        d = fleet._delta(before, after)
+        self.assertIn("6.9 -> 1.5", d)
+        self.assertIn("525/1100 -> 500/1120", d)
 
 
 if __name__ == "__main__":

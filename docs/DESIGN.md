@@ -44,8 +44,13 @@ and never disqualifies a combination.
 ## Winner selection
 
 A combination passes the gate when its error rate is unknown or at or below
-`--max-error` (default 3.5%). The best setting is the lowest J/TH among passers
-that also held hashrate in tolerance, with ties broken by higher hashrate. If no
+`--max-error` (default 3.5%). A passer must also hold hashrate in tolerance and
+leave thermal headroom: its average chip temp at least `--thermal-margin` below
+`--max-temp`, and its average VR temp below the VR cap by a margin (a short
+window can settle just under the cap while true steady state runs hotter, so the
+margin keeps a marginal setting from being applied and then overheating). The
+best setting is the lowest J/TH among passers, ties broken by preferring a
+thermally-settled combo, then higher hashrate, then steadier hashrate. If no
 combination passes, the tool falls back to the best of the remaining results,
 preferring in-tolerance hashrate and a full (non-early-aborted) window, then
 lowest error, then efficiency. The reported
@@ -91,8 +96,13 @@ claiming success if that restore request fails.
 
 The JSON keeps the upstream shape and adds `errorRate`, `errorRateStd`,
 `errorCountDelta`, `passedErrorGate`, `hashrateWithinTolerance`, `earlyAborted`,
-`hashrateStd`, and fan telemetry (`averageFanSpeed`, `averageFanRpm`) per result.
-A CSV and a ranked console summary are written alongside it.
+`hashrateStd`, `thermallySettled`, and fan telemetry (`averageFanSpeed`,
+`averageFanRpm`) per result. A CSV and a ranked console summary are written
+alongside it. After the winner is applied, an optional `--soak` watches it at
+steady state and warns on drift, and the summary flags cooling-limited hardware
+(fan pegged with the chip pinned near the cap). A companion `fleet.py` runs the
+tool across many miners, prints a flagged status table and before/after deltas,
+and can log status snapshots for long-term cooling-trend tracking.
 
 ## Compatibility
 

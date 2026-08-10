@@ -12,6 +12,7 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 - **`refine` mode**: rescue an unstable ASIC. It sweeps voltage up to the lowest setting that clears the ceiling, then probes down for a lower-voltage setting that still passes (better J/TH). If the chip hits the temperature ceiling before the error clears, it lowers the frequency and retries, since frequency is the effective lever once cooling is the limit. Combinations that clearly can't clear the ceiling are stopped early (and still recorded) to save time.
 - **`efficiency` mode**: for a healthy miner. It holds the frequency and lowers voltage from the current setting to the lowest voltage that still clears the ceiling, cutting power and heat with no loss of hashrate.
 - **Robustness**: settings are read back and confirmed after each apply, so a failed PATCH or watchdog reboot can't mislabel a result. During the post-apply stabilization wait the device is monitored, so a combo that is already over the temperature/power limit is dropped before the sample window is wasted (and refine treats it as a reason to lower frequency). A dropped request retries once instead of ending the run. The gate uses a light trimmed mean and records the spread (`std`/`min`/`max`) so one noisy sample won't flip a borderline result.
+- **Thermal-aware selection**: a winner must average below `--max-temp` by a margin (a short window can settle just under the cap while true steady state runs hotter), VR temperature is a first-class limit alongside chip temp, and combos still heating at window end are flagged `thermallySettled: false`. Optional `--soak` watches the applied setting at steady state and warns if it drifts over. The tool also calls out **cooling-limited hardware** (fan pegged while the chip stays pinned near the cap) that tuning cannot fix, and refine stops walking such a unit down to the floor.
 - **Configurable chip-temp cutoff** (`--max-temp`): BM1370/Gamma boards often idle near 65°C and need 68 to leave room to raise voltage.
 - **CSV export and a ranked summary** (highest hashrate, most efficient, lowest error) alongside the existing JSON.
 - **Resume** (`--resume`): reload prior results for an IP and skip already-tested combinations.
@@ -97,6 +98,9 @@ Optional parameters:
 - `--mode {grid,refine,efficiency}`: full sweep (default), rescue an unstable ASIC, or trim voltage down on a healthy one
 - `--max-error <pct>`: error-rate ceiling for selecting the best setting (default: 3.5)
 - `--max-temp <C>`: chip temperature cutoff (default: 66; BM1370/Gamma often need 68)
+- `--thermal-margin <C>`: require a winner to average this far below `--max-temp` for steady-state headroom (default: 1.5)
+- `--soak <min>`: after applying the best setting, watch it at steady state for this long and warn if temp/error drift over (0 = off; recommended for `refine`)
+- `--bracket`: in `refine`, also test one frequency step below a passing frequency and pick whichever is more efficient
 - `--no-error-gate`: report the error rate but do not use it to gate selection
 - `--resume`: reload prior results for this IP and skip already-tested combos
 - `--benchmark-time <s>`: override the per-combo window in seconds (default: 600)
@@ -146,14 +150,20 @@ Status snapshot (read-only) of several miners at once:
 python fleet.py 192.168.2.10 192.168.2.11 192.168.2.12
 python fleet.py --file miners.txt        # one IP per line, # comments allowed
 ```
-It prints a table of hashrate, error, temp, VR temp, fan, J/TH and uptime per miner.
+It prints a table of hashrate, error, temp, VR temp, fan, J/TH and uptime per miner. Rows breaching a threshold are flagged (`!err` over the ceiling, `!temp` hot, `!cooling` for a hot chip with the fan pegged) so a large fleet reads as an action list. Missing values show `n/a` rather than a misleading `0`.
 
-Run the benchmark across the whole fleet, one miner at a time, then show the resulting state:
+A `--file` line may carry per-miner arguments after the IP, which are appended to whatever follows `--run` (useful for a mixed fleet):
+```
+192.168.2.10 --max-temp 68
+192.168.2.11
+```
+
+Run the benchmark across the whole fleet, one miner at a time, then show a before/after delta and the resulting state:
 ```bash
 python fleet.py --file miners.txt --run "--check --max-temp 68"
 python fleet.py 192.168.2.10 192.168.2.11 --run "--mode refine --max-temp 68 --benchmark-time 300"
 ```
-Anything after `--run` is passed straight through to `bitaxe_hashrate_benchmark.py`.
+Anything after `--run` is passed straight through to `bitaxe_hashrate_benchmark.py`. `fleet.py` exits non-zero if any miner's run failed, so it can be scripted. Add `--log fleet_trend.csv` to append each snapshot to a CSV, so cooling degradation shows up as a rising fan/temp trend long before errors do.
 
 ## Benchmarking process
 
@@ -218,6 +228,8 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
 ## Safety Features
 
 - Automatic temperature monitoring with configurable safety cutoff (66°C chip temp default), enforced both during sampling and during the post-apply stabilization window
+- Thermal-margin gate: a winning setting must average below the chip and VR cutoffs by a margin, so a setting that only passed a short window is not applied and then found to run hotter at steady state
+- Cooling-limited detection: when the fan is pegged and the chip stays pinned near the cap, the tool reports degraded cooling and refine stops walking the frequency down (tuning can't fix a cooling fault)
 - Voltage regulator (VR) temperature monitoring with safety cutoff (86°C)
 - Input voltage monitoring with minimum threshold (4800mV) and maximum threshold (5500mV)
 - Power consumption monitoring with safety cutoff (40W)

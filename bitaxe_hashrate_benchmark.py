@@ -44,6 +44,10 @@ max_error_rate = 3.5          # Error-rate ceiling in percent (default)
 error_gate_enabled = True     # Discard combos above the ceiling when selecting best
 benchmark_mode = "grid"       # "grid" or "refine"
 resume_enabled = False
+thermal_margin = 1.5          # Require avg chip temp <= max_temp - this to pass (headroom)
+vr_margin = 4.0               # Require avg VR temp <= max_vr_temp - this to pass
+soak_minutes = 0              # Post-run soak-verify duration (0 = off)
+bracket_enabled = False       # refine: also test one frequency step down for J/TH
 
 # Determined from the device
 small_core_count = None
@@ -92,6 +96,14 @@ def parse_arguments():
                         help='Error-rate ceiling in percent for selecting the best setting (default: 3.5)')
     parser.add_argument('--max-temp', type=int, default=66,
                         help='Chip temperature cutoff in C (default: 66; BM1370/Gamma often need 68)')
+    parser.add_argument('--thermal-margin', type=float, default=1.5,
+                        help='Require a passing combo to average this many C below --max-temp, '
+                             'for steady-state headroom (default: 1.5)')
+    parser.add_argument('--soak', type=int, default=0,
+                        help='After applying the best setting, watch it at steady state for this many '
+                             'minutes and warn if temp/error drift over (0 = off; useful for refine)')
+    parser.add_argument('--bracket', action='store_true',
+                        help='refine: after a passing frequency, also test one step lower for better J/TH')
     parser.add_argument('--no-error-gate', action='store_true',
                         help='Report error rate but do not use it to gate the best setting (legacy pick behavior)')
     parser.add_argument('--resume', action='store_true',
@@ -193,13 +205,55 @@ def passes_error_gate(error_rate, ceiling):
     return error_rate is None or error_rate <= ceiling
 
 
-def select_best(all_results, ceiling, gate_enabled=True):
-    """Pick the best result: lowest J/TH among gate passers, ties to higher hashrate.
+def passes_thermal(res, max_t, chip_margin, max_vr, vr_margin):
+    """Whether a combo leaves thermal headroom at steady state: its average chip
+    temp is at least chip_margin below the cap, and its average VR temp is at
+    least vr_margin below the VR cap. Missing readings don't disqualify."""
+    t = res.get("averageTemperature")
+    if t is not None and t > max_t - chip_margin:
+        return False
+    vr = res.get("averageVRTemp")
+    if vr is not None and vr > max_vr - vr_margin:
+        return False
+    return True
 
-    A passer must both stay within the error ceiling and hold its hashrate in
-    tolerance (a throttling combo with depressed hashrate must not win). Falls
-    back to the lowest-error, in-tolerance combo when nothing passes the gate.
-    Returns the chosen result dict, or None when there are no results."""
+
+def temp_slope_per_min(temps, interval_s):
+    """Least-squares slope of a temperature series, in C per minute (None if too
+    few points). A clearly positive slope means the chip was still heating at the
+    end of the window, i.e. not thermally settled."""
+    n = len(temps)
+    if n < 4:
+        return None
+    mx = (n - 1) / 2.0
+    my = sum(temps) / n
+    denom = sum((i - mx) ** 2 for i in range(n))
+    if denom == 0:
+        return 0.0
+    slope_per_sample = sum((i - mx) * (temps[i] - my) for i in range(n)) / denom
+    return slope_per_sample * (60.0 / interval_s)
+
+
+def cooling_limited(results, max_t):
+    """True when the tested combos show a chip pinned near the temperature cap with
+    the fan maxed - degraded cooling that tuning cannot fix. Needs fan data."""
+    fanned = [r for r in results if r.get("averageFanSpeed") is not None]
+    if not fanned:
+        return False
+    hot = [r for r in fanned
+           if r.get("averageFanSpeed", 0) >= 95 and (r.get("averageTemperature") or 0) >= max_t - 2]
+    return bool(hot) and len(hot) >= len(fanned) / 2
+
+
+def select_best(all_results, ceiling, gate_enabled=True):
+    """Pick the best result: lowest J/TH among passers, ties to higher hashrate
+    then steadier hashrate, preferring thermally-settled combos.
+
+    A passer must stay within the error ceiling, hold its hashrate in tolerance
+    (a throttling combo must not win), and leave thermal headroom (avg temp/VR
+    below their caps by a margin, so a combo that only passed a short window but
+    runs hotter at steady state is not chosen). Falls back to the lowest-error,
+    in-tolerance combo when nothing passes. Returns the chosen dict, or None."""
     if not all_results:
         return None
 
@@ -212,13 +266,21 @@ def select_best(all_results, ceiling, gate_enabled=True):
         # legacy file that predates the field) still decides correctly.
         return passes_error_gate(r.get('errorRate'), ceiling)
 
+    def thermal_ok(r):
+        return passes_thermal(r, max_temp, thermal_margin, max_vr_temp, vr_margin)
+
     if gate_enabled:
-        passers = [r for r in all_results if gate_ok(r) and in_tolerance(r)]
+        passers = [r for r in all_results if gate_ok(r) and in_tolerance(r) and thermal_ok(r)]
     else:
-        passers = [r for r in all_results if in_tolerance(r)]
+        passers = [r for r in all_results if in_tolerance(r) and thermal_ok(r)]
+
+    def rank(r):
+        # efficiency first, then prefer settled, higher hashrate, steadier hashrate
+        return (r['efficiencyJTH'], not r.get('thermallySettled', True),
+                -r['averageHashRate'], r.get('hashrateStd') or 0)
 
     if passers:
-        return sorted(passers, key=lambda r: (r['efficiencyJTH'], -r['averageHashRate']))[0]
+        return sorted(passers, key=rank)[0]
 
     # Nothing passed - prefer in-tolerance and full-window data, then lowest
     # error, then efficiency. (Early-aborted combos are partial-window floors.)
@@ -391,6 +453,9 @@ def monitored_stabilization():
                    f"for system stabilization..." + RESET)
     poll = 5
     waited = 0
+    # Require two consecutive over-limit polls before aborting, so a single
+    # transient spike during the settle doesn't wrongly mark a combo capped.
+    strikes = {"CHIP_TEMP_EXCEEDED": 0, "VR_TEMP_EXCEEDED": 0, "POWER_CONSUMPTION_EXCEEDED": 0}
     while waited < sleep_time:
         time.sleep(poll)
         waited += poll
@@ -400,18 +465,19 @@ def monitored_stabilization():
         temp = info.get("temp")
         vr = info.get("vrTemp")
         power = info.get("power")
+        breach = None
         if temp is not None and temp >= max_temp:
-            print(RED + f"Chip temperature {temp:.1f}°C hit the {max_temp}°C limit during stabilization; "
-                        f"aborting this combo." + RESET)
-            return "CHIP_TEMP_EXCEEDED"
-        if vr is not None and vr >= max_vr_temp:
-            print(RED + f"VR temperature {vr:.1f}°C hit the {max_vr_temp}°C limit during stabilization; "
-                        f"aborting this combo." + RESET)
-            return "VR_TEMP_EXCEEDED"
-        if power is not None and power > max_power:
-            print(RED + f"Power {power:.1f}W exceeded {max_power}W during stabilization; "
-                        f"aborting this combo." + RESET)
-            return "POWER_CONSUMPTION_EXCEEDED"
+            breach = "CHIP_TEMP_EXCEEDED"
+        elif vr is not None and vr >= max_vr_temp:
+            breach = "VR_TEMP_EXCEEDED"
+        elif power is not None and power > max_power:
+            breach = "POWER_CONSUMPTION_EXCEEDED"
+        for reason in strikes:
+            strikes[reason] = strikes[reason] + 1 if reason == breach else 0
+        if breach and strikes[breach] >= 2:
+            print(RED + f"{breach} sustained during stabilization "
+                        f"(temp {temp}, vr {vr}, power {power}); aborting this combo." + RESET)
+            return breach
     return None
 
 
@@ -425,7 +491,8 @@ def apply_settings(core_voltage, frequency):
     when a silently-failed PATCH or a watchdog reboot leaves the device on the
     wrong voltage/frequency (which would otherwise mislabel the measurement)."""
     for attempt in range(2):
-        set_system_settings(core_voltage, frequency)
+        if not set_system_settings(core_voltage, frequency):
+            continue  # PATCH/restart request failed; retry without wasting a 90s soak
         reason = monitored_stabilization()
         if reason is not None:
             return False, reason
@@ -457,6 +524,8 @@ def _iter_result(ok=False, reason=None, **kw):
         "hashrateStd": None,
         "averageFanSpeed": None,
         "averageFanRpm": None,
+        "thermallySettled": True,
+        "tempSlope": None,
         "earlyAborted": False,
     }
     r.update(kw)
@@ -501,6 +570,11 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     chron_temps = temperatures[warmup_samples:] if len(temperatures) > warmup_samples else temperatures
     average_temperature = sum(chron_temps) / len(chron_temps)
 
+    # Is the chip still heating at the end of the window? A short window can pass
+    # just under the cap while true steady state creeps higher.
+    temp_slope = temp_slope_per_min(chron_temps, sample_interval)
+    thermally_settled = temp_slope is None or temp_slope < 0.15
+
     average_vr_temp = None
     if vr_temps:
         chron_vr = vr_temps[warmup_samples:] if len(vr_temps) > warmup_samples else vr_temps
@@ -533,7 +607,9 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     tag = " [early]" if early else ""
     print(GREEN + f"Average Hashrate{tag}: {average_hashrate:.2f} GH/s (±{hashrate_std:.1f}, "
                   f"Expected: {expected_hashrate:.2f} GH/s)" + RESET)
-    print(GREEN + f"Average Temperature: {average_temperature:.2f}°C" + RESET)
+    heating = "" if thermally_settled else f"  (still heating +{temp_slope:.2f}°C/min, not settled)"
+    colour_t = GREEN if thermally_settled else YELLOW
+    print(colour_t + f"Average Temperature: {average_temperature:.2f}°C{heating}" + RESET)
     if average_vr_temp is not None:
         print(GREEN + f"Average VR Temperature: {average_vr_temp:.2f}°C" + RESET)
     if average_fan_speed is not None:
@@ -564,6 +640,8 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         hashrateStd=hashrate_std,
         averageFanSpeed=average_fan_speed,
         averageFanRpm=average_fan_rpm,
+        thermallySettled=thermally_settled,
+        tempSlope=temp_slope,
         earlyAborted=early,
     )
 
@@ -704,7 +782,7 @@ def benchmark_iteration(core_voltage, frequency):
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
                   avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
                   error_stats=None, early_aborted=False, hashrate_std=None,
-                  fan_speed=None, fan_rpm=None):
+                  fan_speed=None, fan_rpm=None, thermally_settled=True):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
@@ -716,6 +794,7 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "errorCountDelta": error_count_delta,
         "passedErrorGate": passes_error_gate(error_rate, max_error_rate),
         "hashrateWithinTolerance": hashrate_ok,
+        "thermallySettled": thermally_settled,
         "earlyAborted": early_aborted,
     }
     if error_stats is not None:
@@ -791,7 +870,7 @@ def save_csv():
         filename = results_filename("csv")
         fields = ["coreVoltage", "frequency", "averageHashRate", "hashrateStd", "efficiencyJTH",
                   "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate",
-                  "hashrateWithinTolerance", "earlyAborted",
+                  "hashrateWithinTolerance", "thermallySettled", "earlyAborted",
                   "averageTemperature", "averageVRTemp", "averageFanSpeed", "averageFanRpm"]
         with open(filename, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -863,6 +942,15 @@ def print_summary():
         print(GREEN + f"\nSelected best (error-gate {max_error_rate:.1f}% -> efficiency):" + RESET)
         print(GREEN + f"  {best['coreVoltage']}mV / {best['frequency']}MHz | "
                       f"{best['averageHashRate']:.1f} GH/s | {best['efficiencyJTH']:.2f} J/TH | error {er_str}" + RESET)
+    print_cooling_verdict(results)
+
+
+def print_cooling_verdict(results):
+    """Warn when the data shows degraded cooling that tuning cannot fix."""
+    if cooling_limited(results, max_temp):
+        print(RED + "\nCooling-limited hardware: the fan is maxed and the chip sits near the "
+                    "temperature cap even at the tested settings. This is degraded cooling (thermal "
+                    "paste, fan, or airflow) - tuning can't fix it. Service the cooling and re-run." + RESET)
 
 
 def save_final_json():
@@ -883,6 +971,7 @@ def save_final_json():
             "errorCountDelta": r.get("errorCountDelta"),
             "passedErrorGate": r.get("passedErrorGate"),
             "hashrateWithinTolerance": r.get("hashrateWithinTolerance"),
+            "thermallySettled": r.get("thermallySettled", True),
             "earlyAborted": r.get("earlyAborted", False),
         }
         if "averageVRTemp" in r:
@@ -929,7 +1018,7 @@ def run_combo(voltage, frequency):
                                 r["errorCountDelta"], r["hashrateWithinTolerance"],
                                 error_stats=r["errorStats"], early_aborted=r["earlyAborted"],
                                 hashrate_std=r["hashrateStd"], fan_speed=r["averageFanSpeed"],
-                                fan_rpm=r["averageFanRpm"])
+                                fan_rpm=r["averageFanRpm"], thermally_settled=r["thermallySettled"])
             save_results()
             return res, r["reason"]
         if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
@@ -941,9 +1030,12 @@ def run_combo(voltage, frequency):
 
 def combo_passes(res):
     # Recompute against the active ceiling (see select_best) rather than trusting a
-    # persisted passedErrorGate, which may be stale on a resume.
+    # persisted passedErrorGate, which may be stale on a resume. Also require
+    # thermal headroom so refine/efficiency don't accept a setting that only passed
+    # a short window but runs hotter at steady state.
     gate_ok = (not error_gate_enabled) or passes_error_gate(res.get("errorRate"), max_error_rate)
-    return gate_ok and res.get("hashrateWithinTolerance", True)
+    return (gate_ok and res.get("hashrateWithinTolerance", True)
+            and passes_thermal(res, max_temp, thermal_margin, max_vr_temp, vr_margin))
 
 
 def run_grid():
@@ -1073,11 +1165,28 @@ def run_refine():
     print(GREEN + f"Refine mode: starting at {frequency}MHz, sweeping voltage from "
                   f"{initial_voltage}mV (ceiling {max_error_rate:.1f}% error, {max_temp}°C)." + RESET)
 
+    consecutive_caps = 0
     while frequency >= min_allowed_frequency:
         outcome = _refine_sweep_at(frequency)
         if outcome == "passed":
+            # --bracket: the highest passing frequency maximizes hashrate, but one
+            # step down may be more efficient. Test it and let select_best compare.
+            lower = frequency - frequency_increment
+            if bracket_enabled and lower >= min_allowed_frequency:
+                print(GREEN + f"Bracket: also testing {lower}MHz for better J/TH." + RESET)
+                _refine_sweep_at(lower)
             return
         if outcome == "capped":
+            consecutive_caps += 1
+            # After a few frequencies capped in a row with the fan pegged, this is
+            # degraded cooling, not an overclock - don't walk it down to the floor.
+            if consecutive_caps >= 3:
+                info = _quick_info()
+                if info and (info.get("fanspeed") or 0) >= 95:
+                    print(RED + "Cooling-limited hardware: capped at several frequencies with the fan "
+                                "maxed. Stopping - service the cooling (paste/fan/airflow); tuning "
+                                "can't fix this." + RESET)
+                    return
             frequency -= frequency_increment
             if frequency >= min_allowed_frequency:
                 print(YELLOW + f"Thermally capped at this frequency; dropping to {frequency}MHz "
@@ -1152,12 +1261,62 @@ def run_check():
     if r["averageFanSpeed"] is not None:
         rpm = f", {r['averageFanRpm']:.0f} RPM" if r["averageFanRpm"] is not None else ""
         fan = f"\n  Fan:        {r['averageFanSpeed']:.0f}%{rpm}"
+    settled = "" if r.get("thermallySettled", True) else "  (still heating - not thermally settled)"
     print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz{partial}\n"
                   f"  Hashrate:   {r['averageHashRate']:.1f} GH/s{hstd}\n"
                   f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
                   f"  Error:      {er} [{gate} @ {max_error_rate:.1f}%]\n"
-                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}{fan}" + RESET)
+                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}{settled}{fan}" + RESET)
+    print_cooling_verdict([r])
     return True
+
+
+def run_soak(minutes):
+    """After the best setting is applied and the device is running it, watch it at
+    steady state (no reboot) and warn if temperature or error drift over their
+    limits. This is what turns refine's 'it's fixed now' into a measured claim
+    rather than an extrapolation from a short window."""
+    info = get_system_info()
+    if not info:
+        print(YELLOW + "Soak: device not reachable; skipping." + RESET)
+        return
+    v, f = info.get("coreVoltage"), info.get("frequency")
+    print(GREEN + f"\nSoak verify: watching {v}mV / {f}MHz for {minutes} min at steady state "
+                  f"(no reboot)..." + RESET)
+    poll = 30
+    polls = max(1, minutes * 60 // poll)
+    max_temp_seen = max_vr_seen = 0.0
+    errs = []
+    for i in range(polls):
+        time.sleep(poll)
+        info = _quick_info()
+        if not info:
+            continue
+        t = info.get("temp") or 0
+        vr = info.get("vrTemp") or 0
+        ep = info.get("errorPercentage")
+        max_temp_seen = max(max_temp_seen, t)
+        max_vr_seen = max(max_vr_seen, vr)
+        if ep is not None:
+            errs.append(ep)
+        elapsed = (i + 1) * poll
+        er_txt = "n/a" if ep is None else f"{ep:.1f}%"
+        print(YELLOW + f"  soak {elapsed // 60}m{elapsed % 60:02d}s: {t:.1f}°C  vr {vr:.0f}°C  err {er_txt}" + RESET)
+    mean_err = sum(errs) / len(errs) if errs else None
+    issues = []
+    if max_temp_seen >= max_temp:
+        issues.append(f"chip reached {max_temp_seen:.1f}°C (cap {max_temp})")
+    if max_vr_seen >= max_vr_temp:
+        issues.append(f"VR reached {max_vr_seen:.1f}°C (cap {max_vr_temp})")
+    if mean_err is not None and mean_err > max_error_rate:
+        issues.append(f"error {mean_err:.1f}% over the {max_error_rate}% ceiling")
+    if issues:
+        print(RED + "Soak WARNING: the applied setting drifts at steady state - " + "; ".join(issues) +
+                    ". Consider a lower frequency, or more headroom via --thermal-margin / --max-temp." + RESET)
+    else:
+        err_txt = "n/a" if mean_err is None else f"{mean_err:.1f}%"
+        print(GREEN + f"Soak OK: steady at max {max_temp_seen:.1f}°C / VR {max_vr_seen:.0f}°C, "
+                      f"error {err_txt}." + RESET)
 
 
 def print_run_expectations():
@@ -1182,6 +1341,7 @@ def main():
     global bitaxe_ip, initial_voltage, initial_frequency, benchmark_time
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
     global max_temp, system_reset_done, voltage_increment, frequency_increment, check_mode
+    global thermal_margin, soak_minutes, bracket_enabled
 
     # On Windows, this call turns on ANSI escape processing so the colored output
     # renders in the classic console (Windows Terminal already supports it).
@@ -1200,6 +1360,9 @@ def main():
     error_gate_enabled = not args.no_error_gate
     benchmark_mode = args.mode
     resume_enabled = args.resume
+    thermal_margin = args.thermal_margin
+    soak_minutes = args.soak
+    bracket_enabled = args.bracket
     if args.benchmark_time is not None:
         benchmark_time = args.benchmark_time
     elif args.check:
@@ -1304,6 +1467,8 @@ def main():
             save_final_json()
             print(GREEN + "\nBenchmarking completed." + RESET)
             print_summary()
+            if soak_minutes > 0 and not handling_interrupt:
+                run_soak(soak_minutes)
 
     if exit_code:
         sys.exit(exit_code)
