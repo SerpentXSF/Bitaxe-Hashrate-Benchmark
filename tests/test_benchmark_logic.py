@@ -391,6 +391,16 @@ class TestRefineControlFlow(unittest.TestCase):
             outcome = b._refine_sweep_at(b.initial_frequency)
         self.assertEqual(outcome, "passed")
 
+    def test_thermal_margin_only_failure_caps_not_climbs(self):
+        # A combo fine on error/hashrate but over the thermal margin must cap
+        # (drop frequency), not climb voltage (which only adds heat).
+        b.thermal_margin = 1.5   # cap-margin = 68 - 1.5 = 66.5
+        rec = {"coreVoltage": b.initial_voltage, "frequency": 600, "averageHashRate": 1200,
+               "efficiencyJTH": 15.0, "errorRate": 2.0, "passedErrorGate": True,
+               "hashrateWithinTolerance": True, "averageTemperature": 67.0}
+        with mock.patch.object(b, "run_combo", return_value=(rec, None)):
+            self.assertEqual(b._refine_sweep_at(600), "capped")
+
 
 class TestCheckMode(unittest.TestCase):
     """--check must measure the current setting without applying or rebooting."""

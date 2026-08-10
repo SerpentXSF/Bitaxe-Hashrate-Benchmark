@@ -70,6 +70,7 @@ RESTORE_FAIL_WARNING = ("WARNING: could not confirm the restore - the miner may 
 handling_interrupt = False
 system_reset_done = False
 check_mode = False            # read-only --check run: never mutate the device
+interrupted = False           # sticky: set on Ctrl+C, never cleared (gates the soak)
 
 
 def parse_arguments():
@@ -275,8 +276,9 @@ def select_best(all_results, ceiling, gate_enabled=True):
         passers = [r for r in all_results if in_tolerance(r) and thermal_ok(r)]
 
     def rank(r):
-        # efficiency first, then prefer settled, higher hashrate, steadier hashrate
-        return (r['efficiencyJTH'], not r.get('thermallySettled', True),
+        # Bucket J/TH to 0.1 so near-equal-efficiency combos are then ordered by
+        # thermally-settled, higher hashrate, and steadier hashrate.
+        return (round(r['efficiencyJTH'], 1), not r.get('thermallySettled', True),
                 -r['averageHashRate'], r.get('hashrateStd') or 0)
 
     if passers:
@@ -351,10 +353,13 @@ def fetch_default_settings():
 
 
 def handle_sigint(signum, frame):
-    global system_reset_done, handling_interrupt
+    global system_reset_done, handling_interrupt, interrupted
 
-    if handling_interrupt or system_reset_done:
-        return
+    interrupted = True   # sticky: never cleared, so post-run steps (soak) can skip
+    if handling_interrupt:
+        return           # already mid-restore; ignore re-entrant signal
+    if system_reset_done:
+        sys.exit(0)      # restore already done (e.g. during a soak) - let Ctrl+C exit
 
     # A --check run never changed anything, so exit without touching the device.
     if check_mode:
@@ -782,7 +787,7 @@ def benchmark_iteration(core_voltage, frequency):
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
                   avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
                   error_stats=None, early_aborted=False, hashrate_std=None,
-                  fan_speed=None, fan_rpm=None, thermally_settled=True):
+                  fan_speed=None, fan_rpm=None, thermally_settled=True, temp_slope=None):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
@@ -795,6 +800,7 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "passedErrorGate": passes_error_gate(error_rate, max_error_rate),
         "hashrateWithinTolerance": hashrate_ok,
         "thermallySettled": thermally_settled,
+        "tempSlope": temp_slope,
         "earlyAborted": early_aborted,
     }
     if error_stats is not None:
@@ -870,7 +876,7 @@ def save_csv():
         filename = results_filename("csv")
         fields = ["coreVoltage", "frequency", "averageHashRate", "hashrateStd", "efficiencyJTH",
                   "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate",
-                  "hashrateWithinTolerance", "thermallySettled", "earlyAborted",
+                  "hashrateWithinTolerance", "thermallySettled", "tempSlope", "earlyAborted",
                   "averageTemperature", "averageVRTemp", "averageFanSpeed", "averageFanRpm"]
         with open(filename, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
@@ -894,9 +900,16 @@ def reset_to_best_setting():
     best_frequency = best_result["frequency"]
     er = best_result.get("errorRate")
     er_str = f"{er:.2f}%" if er is not None else "n/a"
-    if error_gate_enabled and not passes_error_gate(er, max_error_rate):
-        print(YELLOW + "Warning: no setting stayed within the error ceiling; "
-                       "applying the lowest-error result found." + RESET)
+    if not combo_passes(best_result):
+        why = []
+        if error_gate_enabled and not passes_error_gate(er, max_error_rate):
+            why.append("error ceiling")
+        if not best_result.get("hashrateWithinTolerance", True):
+            why.append("hashrate tolerance")
+        if not passes_thermal(best_result, max_temp, thermal_margin, max_vr_temp, vr_margin):
+            why.append("thermal headroom")
+        print(YELLOW + f"Warning: no setting met all limits ({', '.join(why)}); "
+                       f"applying the least-bad result found." + RESET)
     print(GREEN + f"Applying the best settings from benchmarking:\n"
                   f"  Core Voltage: {best_voltage}mV\n"
                   f"  Frequency: {best_frequency}MHz\n"
@@ -972,6 +985,7 @@ def save_final_json():
             "passedErrorGate": r.get("passedErrorGate"),
             "hashrateWithinTolerance": r.get("hashrateWithinTolerance"),
             "thermallySettled": r.get("thermallySettled", True),
+            "tempSlope": r.get("tempSlope"),
             "earlyAborted": r.get("earlyAborted", False),
         }
         if "averageVRTemp" in r:
@@ -1018,7 +1032,8 @@ def run_combo(voltage, frequency):
                                 r["errorCountDelta"], r["hashrateWithinTolerance"],
                                 error_stats=r["errorStats"], early_aborted=r["earlyAborted"],
                                 hashrate_std=r["hashrateStd"], fan_speed=r["averageFanSpeed"],
-                                fan_rpm=r["averageFanRpm"], thermally_settled=r["thermallySettled"])
+                                fan_rpm=r["averageFanRpm"], thermally_settled=r["thermallySettled"],
+                                temp_slope=r["tempSlope"])
             save_results()
             return res, r["reason"]
         if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
@@ -1028,13 +1043,18 @@ def run_combo(voltage, frequency):
     return None, "SYSTEM_INFO_FAILURE"
 
 
+def error_and_hashrate_ok(res):
+    """Error gate (or disabled) and hashrate tolerance, ignoring the thermal margin."""
+    gate_ok = (not error_gate_enabled) or passes_error_gate(res.get("errorRate"), max_error_rate)
+    return gate_ok and res.get("hashrateWithinTolerance", True)
+
+
 def combo_passes(res):
     # Recompute against the active ceiling (see select_best) rather than trusting a
     # persisted passedErrorGate, which may be stale on a resume. Also require
     # thermal headroom so refine/efficiency don't accept a setting that only passed
     # a short window but runs hotter at steady state.
-    gate_ok = (not error_gate_enabled) or passes_error_gate(res.get("errorRate"), max_error_rate)
-    return (gate_ok and res.get("hashrateWithinTolerance", True)
+    return (error_and_hashrate_ok(res)
             and passes_thermal(res, max_temp, thermal_margin, max_vr_temp, vr_margin))
 
 
@@ -1130,6 +1150,10 @@ def _refine_sweep_at(frequency):
                 if first:
                     _refine_probe_down(frequency, voltage)
                 return "passed"
+            # A recorded combo that's fine on error/hashrate but only lacks thermal
+            # headroom: dropping frequency helps, not more voltage.
+            if rec is not None and error_and_hashrate_ok(rec):
+                return "capped"
             voltage += voltage_increment
             first = False
             continue
@@ -1142,8 +1166,14 @@ def _refine_sweep_at(frequency):
                 if first:
                     _refine_probe_down(frequency, voltage)
                 return "passed"
-            # Recorded but over ceiling / low hashrate (incl. an early-aborted
-            # partial window): needs more voltage.
+            if error_and_hashrate_ok(res):
+                # Error and hashrate are fine; it only lacks thermal headroom.
+                # Adding voltage would add heat, so lower the frequency instead.
+                print(YELLOW + f"{voltage}mV/{frequency}MHz is within error/hashrate but runs too "
+                               f"warm; treating as thermally capped." + RESET)
+                return "capped"
+            # Over ceiling / low hashrate (incl. an early-aborted partial window):
+            # needs more voltage.
             voltage += voltage_increment
             first = False
             print(YELLOW + f"Raising voltage to {voltage}mV to reduce error / stabilize." + RESET)
@@ -1467,7 +1497,7 @@ def main():
             save_final_json()
             print(GREEN + "\nBenchmarking completed." + RESET)
             print_summary()
-            if soak_minutes > 0 and not handling_interrupt:
+            if soak_minutes > 0 and not interrupted:
                 run_soak(soak_minutes)
 
     if exit_code:
