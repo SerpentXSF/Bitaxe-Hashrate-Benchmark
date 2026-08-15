@@ -174,6 +174,51 @@ class TestSelectBest(unittest.TestCase):
     def test_empty_returns_none(self):
         self.assertIsNone(b.select_best([], 3.5))
 
+    def test_prefer_hashrate_beats_leaner_slower_passer(self):
+        # The .149 case: both pass every gate, but one is faster (worse J/TH) and
+        # one is leaner (better J/TH). efficiency picks the leaner; hashrate picks
+        # the faster, so raw output can win when the user asks for it.
+        faster = self._r(1140, 550, 1107, 19.2, 3.26)   # +hashrate, worse J/TH
+        leaner = self._r(1140, 525, 1077, 18.68, 3.49)  # -hashrate, better J/TH
+        rs = [faster, leaner]
+        self.assertEqual(b.select_best(rs, 3.5, True, prefer='efficiency')['frequency'], 525)
+        self.assertEqual(b.select_best(rs, 3.5, True, prefer='hashrate')['frequency'], 550)
+
+    def test_prefer_defaults_to_global(self):
+        faster = self._r(1140, 550, 1107, 19.2, 3.26)
+        leaner = self._r(1140, 525, 1077, 18.68, 3.49)
+        old = b.selection_prefer
+        try:
+            b.selection_prefer = 'hashrate'
+            self.assertEqual(b.select_best([faster, leaner], 3.5, True)['frequency'], 550)
+            b.selection_prefer = 'efficiency'
+            self.assertEqual(b.select_best([faster, leaner], 3.5, True)['frequency'], 525)
+        finally:
+            b.selection_prefer = old
+
+
+class TestBestCaseTrimmedError(unittest.TestCase):
+    def test_projection_drops_one_high_over_full_denominator(self):
+        # Mid-window best case = (sum - max) / (total_post - 2): keep the sum, drop
+        # one high and one (future) 0, over the final trimmed denominator.
+        eps = [2.0, 2.0, 3.0, 3.0, 5.0]   # sum 15, max 5
+        self.assertAlmostEqual(b.best_case_trimmed_error(eps, 14), (15 - 5) / 12)
+
+    def test_none_when_too_few_to_project(self):
+        self.assertIsNone(b.best_case_trimmed_error([1, 2, 3, 4], 14))      # <5 collected
+        self.assertIsNone(b.best_case_trimmed_error([1, 2, 3, 4, 5], 2))    # total_post <= 2
+
+    def test_overstates_error_at_a_full_window(self):
+        # The .149 bug: at a full window the projection drops only the max, while the
+        # real trimmed mean also drops the actual min - so the projection reads high
+        # and must not be used to abort a full window whose true mean would pass.
+        eps = [2.0, 2.0, 3.0, 3.0, 5.0]
+        projected = b.best_case_trimmed_error(eps, len(eps))               # (15-5)/3 = 3.33
+        real, _ = b.compute_window_error([{'error_percentage': e} for e in eps])  # (15-5-2)/3 = 2.67
+        self.assertGreater(projected, real)
+        self.assertGreater(projected, 3.0)   # would have aborted at a 3.0 ceiling...
+        self.assertLess(real, 3.0)            # ...but the real trimmed mean passes
+
 
 class TestErrorStatsAndTrim(unittest.TestCase):
     def test_trimmed_mean_when_enough_samples(self):
@@ -203,7 +248,8 @@ class TestBenchmarkIterationResult(unittest.TestCase):
 
     def setUp(self):
         self._saved = (b.small_core_count, b.asic_count, b.benchmark_time,
-                       b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results)
+                       b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results,
+                       b.extend_on_variance)
         b.small_core_count = 2040
         b.asic_count = 1
         b.benchmark_time = 20
@@ -211,10 +257,12 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         b.error_gate_enabled = True
         b.max_error_rate = 3.5
         b.results = []
+        b.extend_on_variance = False   # base-behavior tests; extension has its own class
 
     def tearDown(self):
         (b.small_core_count, b.asic_count, b.benchmark_time,
-         b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results) = self._saved
+         b.sample_interval, b.error_gate_enabled, b.max_error_rate, b.results,
+         b.extend_on_variance) = self._saved
 
     def _run(self, info_or_seq):
         kw = {"side_effect": info_or_seq} if isinstance(info_or_seq, list) else {"return_value": info_or_seq}
@@ -233,6 +281,23 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         self.assertIsNotNone(r["averageHashRate"])
         self.assertIsNotNone(r["errorRate"])
         self.assertFalse(r["earlyAborted"])
+
+    def test_transient_input_voltage_is_skipped_not_fatal(self):
+        # A few out-of-range input-voltage readings during the ramp are skipped, not
+        # fatal; the combo still completes on the good samples.
+        seq = [make_info(voltage=4000) for _ in range(3)] + [make_info() for _ in range(17)]
+        r = self._run(seq)
+        self.assertTrue(r["ok"])
+        self.assertIsNotNone(r["averageHashRate"])
+
+    def test_persistent_bad_input_voltage_fails_fast(self):
+        # A supply stuck out of range fails after the consecutive cap (8), not after
+        # the whole window. Exactly 8 samples are provided, so a slower failure would
+        # exhaust the mock and raise instead of returning this reason.
+        seq = [make_info(voltage=4000) for _ in range(8)]
+        r = self._run(seq)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["reason"], "INPUT_VOLTAGE_OUT_OF_RANGE")
 
     def test_success_captures_fan_and_hashrate_std(self):
         r = self._run(make_info(fanspeed=80, fanrpm=5000))
@@ -288,6 +353,21 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         r = self._run(seq)
         self.assertTrue(r["ok"])
         self.assertFalse(r["earlyAborted"])
+        self.assertTrue(b.passes_error_gate(r["errorRate"], 3.5))
+
+    def test_full_window_not_false_aborted_on_last_sample(self):
+        # The .149 bug: over the 14 post-warmup samples the best-case projection
+        # (drops only the max) reads (51.2-8)/12 = 3.6% > 3.5% at the final sample,
+        # but the real trimmed mean (drops max AND the actual min) is
+        # (51.2-8-2.4)/12 = 3.4% and passes. The last sample must fall through to
+        # that real mean, not abort - there is no future 0 left to justify the bound.
+        warm = [make_info(ep=1.0) for _ in range(6)]
+        post = ([make_info(ep=8.0)] + [make_info(ep=3.4) for _ in range(12)]
+                + [make_info(ep=2.4)])
+        r = self._run(warm + post)
+        self.assertTrue(r["ok"])
+        self.assertFalse(r["earlyAborted"])
+        self.assertNotEqual(r["reason"], "EARLY_ABORT")
         self.assertTrue(b.passes_error_gate(r["errorRate"], 3.5))
 
 
@@ -583,6 +663,90 @@ class TestCoolingLimited(unittest.TestCase):
 
     def test_no_fan_data_is_false(self):
         self.assertFalse(b.cooling_limited([{"averageTemperature": 65}], 66))
+
+
+class TestExtendOnVariance(unittest.TestCase):
+    """A borderline, noisy error window is extended until the pass/fail verdict is
+    confident (|mean - ceiling| > k*stderr), up to a cap; still-uncertain reads are
+    flagged inconclusive. Motivated by the noisy .149 chip straddling 3.5%."""
+
+    def setUp(self):
+        self._saved = (b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval,
+                       b.error_gate_enabled, b.max_error_rate, b.results, b.extend_on_variance,
+                       b.variance_extend_batch, b.variance_extend_cap, b.uncertainty_k)
+        b.small_core_count = 2040; b.asic_count = 1
+        b.benchmark_time = 20; b.sample_interval = 1        # base 20 samples
+        b.error_gate_enabled = True; b.max_error_rate = 3.5
+        b.results = []
+        b.extend_on_variance = True
+        b.variance_extend_batch = 4; b.variance_extend_cap = 12   # up to 32 samples
+        b.uncertainty_k = 1.5
+
+    def tearDown(self):
+        (b.small_core_count, b.asic_count, b.benchmark_time, b.sample_interval,
+         b.error_gate_enabled, b.max_error_rate, b.results, b.extend_on_variance,
+         b.variance_extend_batch, b.variance_extend_cap, b.uncertainty_k) = self._saved
+
+    def _run(self, seq):
+        m = mock.Mock(side_effect=seq)
+        with mock.patch.object(b, "get_system_info", m), \
+             mock.patch.object(b.time, "sleep", return_value=None):
+            r = b.benchmark_iteration(1150, 525)
+        return r, m.call_count
+
+    def test_mean_ci_margin_uses_trimmed_std(self):
+        # 6 samples (>=5) -> the trimmed set drops the 1 and the 6, so the margin is
+        # std([2,3,4,5]) / sqrt(4) - the SAME trimmed set the verdict mean uses (M1).
+        s = [sample(None, x) for x in (1, 2, 3, 4, 5, 6)]
+        self.assertAlmostEqual(b.mean_ci_margin(s), b.stddev([2, 3, 4, 5]) / (4 ** 0.5))
+
+    def test_verdict_certain_when_far_and_tight(self):
+        # A tight window (std 0) far from the ceiling is a confident pass.
+        self.assertFalse(b.is_verdict_uncertain([sample(None, 2.0) for _ in range(8)], 3.5))
+
+    def test_verdict_uncertain_when_noisy_at_ceiling(self):
+        # Trimmed mean lands on 3.5 with spread -> could flip either way.
+        s = [sample(None, 2.5 if i % 2 == 0 else 4.5) for i in range(8)]
+        self.assertTrue(b.is_verdict_uncertain(s, 3.5))
+
+    def test_extends_a_noisy_borderline_window_to_cap(self):
+        seq = [make_info(ep=(2.5 if i % 2 == 0 else 4.5)) for i in range(40)]
+        r, calls = self._run(seq)
+        self.assertEqual(calls, 32)         # base 20 + cap 12, never overshoots
+        self.assertTrue(r["inconclusive"])  # still uncertain when the cap was hit
+
+    def test_extension_stops_once_confidence_is_reached(self):
+        # Noisy at the ceiling for the base window, then a run of clearly-passing
+        # readings pulls the mean away -> the verdict becomes certain and it stops
+        # before the cap, not flagged inconclusive.
+        seq = ([make_info(ep=(2.5 if i % 2 == 0 else 4.5)) for i in range(20)]
+               + [make_info(ep=1.0) for _ in range(20)])
+        r, calls = self._run(seq)
+        self.assertTrue(20 < calls < 32)
+        self.assertFalse(r["inconclusive"])
+
+    def test_single_spike_does_not_trigger_extension(self):
+        # One 100% rolling-rate spike among clean 1% readings: the spike is trimmed
+        # from BOTH the mean and the std, so the window is a confident pass - it must
+        # not extend to the cap or be flagged inconclusive (regression for M1).
+        seq = ([make_info(ep=1.0) for _ in range(6)] + [make_info(ep=100.0)]
+               + [make_info(ep=1.0) for _ in range(13)])
+        r, calls = self._run(seq)
+        self.assertEqual(calls, 20)
+        self.assertFalse(r["inconclusive"])
+        self.assertLess(r["errorRate"], 3.5)
+
+    def test_confident_window_is_not_extended(self):
+        seq = [make_info(ep=1.0) for _ in range(40)]
+        r, calls = self._run(seq)
+        self.assertEqual(calls, 20)         # no extension
+        self.assertFalse(r["inconclusive"])
+
+    def test_extension_disabled_uses_fixed_window(self):
+        b.extend_on_variance = False
+        seq = [make_info(ep=(2.5 if i % 2 == 0 else 4.5)) for i in range(40)]
+        _, calls = self._run(seq)
+        self.assertEqual(calls, 20)         # fixed window even though noisy/borderline
 
 
 if __name__ == "__main__":

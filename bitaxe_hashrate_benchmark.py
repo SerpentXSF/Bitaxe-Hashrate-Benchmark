@@ -48,6 +48,11 @@ thermal_margin = 1.5          # Require avg chip temp <= max_temp - this to pass
 vr_margin = 4.0               # Require avg VR temp <= max_vr_temp - this to pass
 soak_minutes = 0              # Post-run soak-verify duration (0 = off)
 bracket_enabled = False       # refine: also test one frequency step down for J/TH
+selection_prefer = 'efficiency'  # winner order among passers: 'efficiency' (lowest J/TH) or 'hashrate'
+extend_on_variance = True     # extend a borderline+noisy error window until the verdict is confident
+variance_extend_batch = 4     # extra samples added per extension step
+variance_extend_cap = 12      # max extra samples beyond the base window
+uncertainty_k = 1.5           # extend while |mean - ceiling| <= k * standard-error of the mean
 
 # Determined from the device
 small_core_count = None
@@ -105,6 +110,12 @@ def parse_arguments():
                              'minutes and warn if temp/error drift over (0 = off; useful for refine)')
     parser.add_argument('--bracket', action='store_true',
                         help='refine: after a passing frequency, also test one step lower for better J/TH')
+    parser.add_argument('--prefer', choices=['efficiency', 'hashrate'], default='efficiency',
+                        help="Among settings that pass the error/thermal gates, order the winner by "
+                             "'efficiency' (lowest J/TH, the default) or 'hashrate' (highest first)")
+    parser.add_argument('--no-extend-variance', action='store_true',
+                        help='Do not extend a borderline, noisy error window; use a fixed window even '
+                             'when the pass/fail verdict is statistically uncertain')
     parser.add_argument('--no-error-gate', action='store_true',
                         help='Report error rate but do not use it to gate the best setting (legacy pick behavior)')
     parser.add_argument('--resume', action='store_true',
@@ -144,6 +155,17 @@ def sum_error_count(info):
     return total if found else None
 
 
+def _trimmed_error_values(samples):
+    """The post-warmup error-percentage readings with one extreme dropped at each
+    end when there are enough (>=5) - the exact set the trimmed mean is taken over.
+    Sharing this keeps the mean and its confidence band (mean_ci_margin) consistent,
+    so a single rolling-rate spike dropped from the mean is also dropped from the std."""
+    eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
+    if len(eps) >= 5:
+        return sorted(eps)[1:-1]
+    return eps
+
+
 def compute_window_error(samples):
     """ASIC error rate (percent) over a combo's post-warmup samples.
 
@@ -156,10 +178,49 @@ def compute_window_error(samples):
     eps = [s['error_percentage'] for s in samples if s.get('error_percentage') is not None]
     if not eps:
         return (None, 'unavailable')
-    if len(eps) >= 5:
-        trimmed = sorted(eps)[1:-1]
-        return (sum(trimmed) / len(trimmed), 'errorPercentage-trimmed-mean')
-    return (sum(eps) / len(eps), 'errorPercentage-mean')
+    trimmed = _trimmed_error_values(samples)
+    method = 'errorPercentage-trimmed-mean' if len(eps) >= 5 else 'errorPercentage-mean'
+    return (sum(trimmed) / len(trimmed), method)
+
+
+def best_case_trimmed_error(eps_post, total_post):
+    """Lowest the final trimmed-mean error could still reach if every not-yet-taken
+    sample read 0%: keep the collected error sum, drop one high (the max) and one
+    low (one of those future 0s), over the final trimmed denominator (total_post-2).
+
+    This is only a valid lower bound while at least one sample slot is still open to
+    supply the 0 that gets trimmed as the low. At a full window there is no such 0,
+    and the real trimmed mean (compute_window_error, which also drops the actual
+    min) is lower - so callers must not use this to abort a full window. Returns
+    None when there are too few samples to project (<5 collected, or total_post<=2)."""
+    if total_post <= 2 or len(eps_post) < 5:
+        return None
+    return (sum(eps_post) - max(eps_post)) / (total_post - 2)
+
+
+def mean_ci_margin(samples):
+    """Half-width of a ~1-sigma confidence band on the trimmed error mean: the std
+    over sqrt(n), taken over the SAME trimmed set as the mean (not the raw window),
+    so a single dropped spike can't inflate it. It shrinks as samples accumulate, so
+    it measures how *confidently* the mean is placed - the basis for deciding a noisy
+    window is long enough. `samples` are the per-sample dicts. None with too few."""
+    trimmed = _trimmed_error_values(samples)
+    if len(trimmed) < 2:
+        return None
+    return stddev(trimmed) / (len(trimmed) ** 0.5)
+
+
+def is_verdict_uncertain(samples, ceiling, k=1.5):
+    """True when the trimmed error mean sits within k standard-errors of the ceiling,
+    i.e. a longer window could still flip the pass/fail verdict. Combines 'borderline'
+    (mean near the ceiling) and 'noisy' (wide spread) into one test: a tight window
+    far from the ceiling is certain; a noisy one straddling it is not. `samples` are
+    the per-sample dicts. Unknown/too-few data reads as certain (never blocks)."""
+    rate, _ = compute_window_error(samples)
+    margin = mean_ci_margin(samples)
+    if rate is None or margin is None:
+        return False
+    return abs(rate - ceiling) <= k * margin
 
 
 def stddev(values):
@@ -246,15 +307,22 @@ def cooling_limited(results, max_t):
     return bool(hot) and len(hot) >= len(fanned) / 2
 
 
-def select_best(all_results, ceiling, gate_enabled=True):
-    """Pick the best result: lowest J/TH among passers, ties to higher hashrate
-    then steadier hashrate, preferring thermally-settled combos.
+def select_best(all_results, ceiling, gate_enabled=True, prefer=None):
+    """Pick the best result among the settings that pass the gates.
+
+    With prefer='efficiency' (the default) the winner is the lowest J/TH, ties to
+    higher hashrate then steadier hashrate. With prefer='hashrate' the winner is
+    the highest hashrate, ties to lower J/TH then steadier hashrate; use this when
+    raw output matters more than power, so a leaner-but-slower combo can't win over
+    a faster one that also passes (both are already within every gate).
 
     A passer must stay within the error ceiling, hold its hashrate in tolerance
     (a throttling combo must not win), and leave thermal headroom (avg temp/VR
     below their caps by a margin, so a combo that only passed a short window but
     runs hotter at steady state is not chosen). Falls back to the lowest-error,
     in-tolerance combo when nothing passes. Returns the chosen dict, or None."""
+    if prefer is None:
+        prefer = selection_prefer
     if not all_results:
         return None
 
@@ -275,11 +343,21 @@ def select_best(all_results, ceiling, gate_enabled=True):
     else:
         passers = [r for r in all_results if in_tolerance(r) and thermal_ok(r)]
 
-    def rank(r):
-        # Bucket J/TH to 0.1 so near-equal-efficiency combos are then ordered by
-        # thermally-settled, higher hashrate, and steadier hashrate.
-        return (round(r['efficiencyJTH'], 1), not r.get('thermallySettled', True),
-                -r['averageHashRate'], r.get('hashrateStd') or 0)
+    def settled_first(r):
+        return not r.get('thermallySettled', True)
+
+    if prefer == 'hashrate':
+        def rank(r):
+            # Highest hashrate first, then most efficient, then thermally-settled,
+            # then steadier hashrate.
+            return (-r['averageHashRate'], round(r['efficiencyJTH'], 1),
+                    settled_first(r), r.get('hashrateStd') or 0)
+    else:
+        def rank(r):
+            # Bucket J/TH to 0.1 so near-equal-efficiency combos are then ordered by
+            # thermally-settled, higher hashrate, and steadier hashrate.
+            return (round(r['efficiencyJTH'], 1), settled_first(r),
+                    -r['averageHashRate'], r.get('hashrateStd') or 0)
 
     if passers:
         return sorted(passers, key=rank)[0]
@@ -531,6 +609,7 @@ def _iter_result(ok=False, reason=None, **kw):
         "averageFanRpm": None,
         "thermallySettled": True,
         "tempSlope": None,
+        "inconclusive": False,
         "earlyAborted": False,
     }
     r.update(kw)
@@ -607,6 +686,12 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     error_count_delta = window_error_count(error_window)
     error_stats = window_error_stats(error_window)
 
+    # If the pass/fail verdict is still statistically uncertain at the final (possibly
+    # extended) window - a noisy combo straddling the ceiling that the extension could
+    # not pin down before the cap - flag it rather than reporting a coin-flip as fact.
+    inconclusive = bool(error_gate_enabled and not early
+                        and is_verdict_uncertain(error_window, max_error_rate, uncertainty_k))
+
     hashrate_within_tolerance = (average_hashrate >= expected_hashrate * 0.94)
 
     tag = " [early]" if early else ""
@@ -628,6 +713,9 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         spread = f" (±{error_stats['std']:.1f})" if (error_stats and error_stats.get("std") is not None) else ""
         method_label = "trimmed mean" if "trimmed" in error_method else "mean"
         print(colour + f"Error Rate: {error_rate:.2f}%{spread} ({method_label}{extra}) [{gate_note} @ {max_error_rate:.1f}%]" + RESET)
+        if inconclusive:
+            print(YELLOW + "  (inconclusive: mean is within the noise band of the ceiling; "
+                           "treat this pass/fail as low-confidence)" + RESET)
     else:
         _warn_no_error_data()
 
@@ -647,6 +735,7 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         averageFanRpm=average_fan_rpm,
         thermallySettled=thermally_settled,
         tempSlope=temp_slope,
+        inconclusive=inconclusive,
         earlyAborted=early,
     )
 
@@ -663,8 +752,13 @@ def benchmark_iteration(core_voltage, frequency):
     fan_rpms = []
     total_samples = benchmark_time // sample_interval
     expected_hashrate = frequency * ((small_core_count * asic_count) / 1000)
+    max_total_samples = total_samples + (variance_extend_cap if extend_on_variance else 0)
 
-    for sample in range(total_samples):
+    # total_samples can grow while the loop runs (adaptive extension below), so this
+    # is a while, not a range() for.
+    sample = 0
+    consecutive_bad_voltage = 0   # transient input-voltage dips are tolerated; a persistent run fails fast
+    while sample < total_samples:
         info = get_system_info()
         if info is None:
             print(YELLOW + "Skipping this iteration due to failure in fetching system info." + RESET)
@@ -680,6 +774,7 @@ def benchmark_iteration(core_voltage, frequency):
             print(YELLOW + "Sensor warming up (temp/voltage not ready yet); skipping sample." + RESET)
             if sample < total_samples - 1:
                 time.sleep(sample_interval)
+            sample += 1
             continue
 
         if temp >= max_temp:
@@ -690,13 +785,23 @@ def benchmark_iteration(core_voltage, frequency):
             print(RED + f"Voltage regulator temperature exceeded {max_vr_temp}°C! Stopping current benchmark." + RESET)
             return _iter_fail("VR_TEMP_EXCEEDED")
 
-        if voltage < min_input_voltage:
-            print(RED + f"Input voltage is below the minimum allowed value of {min_input_voltage}mV! Stopping current benchmark." + RESET)
-            return _iter_fail("INPUT_VOLTAGE_BELOW_MIN")
-
-        if voltage > max_input_voltage:
-            print(RED + f"Input voltage is above the maximum allowed value of {max_input_voltage}mV! Stopping current benchmark." + RESET)
-            return _iter_fail("INPUT_VOLTAGE_ABOVE_MAX")
+        # Input voltage can dip (or briefly spike) during the post-reboot ramp; a
+        # single reading outside the window is a transient, so skip that sample
+        # rather than aborting the whole combo over it. But if it stays out of range
+        # for several samples in a row, that is a real PSU problem - fail fast then.
+        if voltage < min_input_voltage or voltage > max_input_voltage:
+            consecutive_bad_voltage += 1
+            if consecutive_bad_voltage >= 8:
+                print(RED + f"Input voltage stayed outside {min_input_voltage}-{max_input_voltage}mV "
+                            f"for {consecutive_bad_voltage} samples in a row; stopping combo." + RESET)
+                return _iter_fail("INPUT_VOLTAGE_OUT_OF_RANGE")
+            print(YELLOW + f"Input voltage {int(voltage)}mV outside "
+                           f"{min_input_voltage}-{max_input_voltage}mV; skipping sample." + RESET)
+            if sample < total_samples - 1:
+                time.sleep(sample_interval)
+            sample += 1
+            continue
+        consecutive_bad_voltage = 0
 
         hash_rate = info.get("hashRate")
         power_consumption = info.get("power")
@@ -705,6 +810,7 @@ def benchmark_iteration(core_voltage, frequency):
             print(YELLOW + "Hashrate or Watts data not ready yet; skipping sample." + RESET)
             if sample < total_samples - 1:
                 time.sleep(sample_interval)
+            sample += 1
             continue
 
         # Unstable/undervolted chips can report a garbage hashrate far above the
@@ -716,6 +822,7 @@ def benchmark_iteration(core_voltage, frequency):
                            f"{int(expected_hashrate)}); skipping sample." + RESET)
             if sample < total_samples - 1:
                 time.sleep(sample_interval)
+            sample += 1
             continue
 
         if power_consumption > max_power:
@@ -759,25 +866,37 @@ def benchmark_iteration(core_voltage, frequency):
 
         # Early abort: if even a perfect (0%) remainder can't pull the window mean
         # under the ceiling, this combo is hopeless. Finalize the partial window
-        # anyway so it's recorded as a floor rather than discarded.
-        if error_gate_enabled:
+        # anyway so it's recorded as a floor rather than discarded. Only while a
+        # sample slot is still open (sample < last) - the projection assumes a
+        # future 0 to trim as the low, which a full window does not have; there the
+        # loop falls through to the real trimmed mean, which decides on its own.
+        if error_gate_enabled and sample < total_samples - 1:
             post = error_samples[warmup_samples:]
             eps_post = [s['error_percentage'] for s in post if s['error_percentage'] is not None]
             total_post = total_samples - warmup_samples
-            if len(eps_post) >= 5 and total_post > 2:
-                # Best case = all remaining samples read 0%. Mirror the final trimmed
-                # mean (drop one high + one low) so a lone rolling-rate spike can't
-                # permanently abort a combo whose full-window mean would have passed.
-                best_case_mean = (sum(eps_post) - max(eps_post)) / (total_post - 2)
-                if best_case_mean > max_error_rate:
-                    print(RED + f"Error ceiling unreachable (best-case trimmed mean {best_case_mean:.1f}% > "
-                                f"{max_error_rate:.1f}%); aborting combo early." + RESET)
-                    return _finalize_window(hash_rates, temperatures, power_consumptions,
-                                            vr_temps, error_samples, expected_hashrate,
-                                            fan_speeds, fan_rpms, early=True)
+            best_case_mean = best_case_trimmed_error(eps_post, total_post)
+            if best_case_mean is not None and best_case_mean > max_error_rate:
+                print(RED + f"Error ceiling unreachable (best-case trimmed mean {best_case_mean:.1f}% > "
+                            f"{max_error_rate:.1f}%); aborting combo early." + RESET)
+                return _finalize_window(hash_rates, temperatures, power_consumptions,
+                                        vr_temps, error_samples, expected_hashrate,
+                                        fan_speeds, fan_rpms, early=True)
+
+        # Adaptive extension: at the last planned sample, if the pass/fail verdict is
+        # still statistically uncertain (a noisy combo hovering near the ceiling),
+        # grow the window a batch at a time up to the cap, so the mean is decided by
+        # confidence rather than by where a fixed window happened to stop.
+        if (extend_on_variance and error_gate_enabled and sample == total_samples - 1
+                and total_samples < max_total_samples):
+            if is_verdict_uncertain(error_samples[warmup_samples:], max_error_rate, uncertainty_k):
+                add = min(variance_extend_batch, max_total_samples - total_samples)
+                total_samples += add
+                print(YELLOW + f"Borderline and noisy near the {max_error_rate:.1f}% ceiling; "
+                               f"extending the window by {add} samples for a confident read." + RESET)
 
         if sample < total_samples - 1:
             time.sleep(sample_interval)
+        sample += 1
 
     return _finalize_window(hash_rates, temperatures, power_consumptions,
                             vr_temps, error_samples, expected_hashrate,
@@ -787,7 +906,8 @@ def benchmark_iteration(core_voltage, frequency):
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
                   avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
                   error_stats=None, early_aborted=False, hashrate_std=None,
-                  fan_speed=None, fan_rpm=None, thermally_settled=True, temp_slope=None):
+                  fan_speed=None, fan_rpm=None, thermally_settled=True, temp_slope=None,
+                  inconclusive=False):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
@@ -801,6 +921,7 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "hashrateWithinTolerance": hashrate_ok,
         "thermallySettled": thermally_settled,
         "tempSlope": temp_slope,
+        "inconclusive": inconclusive,
         "earlyAborted": early_aborted,
     }
     if error_stats is not None:
@@ -875,7 +996,7 @@ def save_csv():
     try:
         filename = results_filename("csv")
         fields = ["coreVoltage", "frequency", "averageHashRate", "hashrateStd", "efficiencyJTH",
-                  "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate",
+                  "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate", "inconclusive",
                   "hashrateWithinTolerance", "thermallySettled", "tempSlope", "earlyAborted",
                   "averageTemperature", "averageVRTemp", "averageFanSpeed", "averageFanRpm"]
         with open(filename, "w", newline="") as f:
@@ -983,6 +1104,7 @@ def save_final_json():
             "errorRateStd": r.get("errorRateStd"),
             "errorCountDelta": r.get("errorCountDelta"),
             "passedErrorGate": r.get("passedErrorGate"),
+            "inconclusive": r.get("inconclusive", False),
             "hashrateWithinTolerance": r.get("hashrateWithinTolerance"),
             "thermallySettled": r.get("thermallySettled", True),
             "tempSlope": r.get("tempSlope"),
@@ -1033,7 +1155,7 @@ def run_combo(voltage, frequency):
                                 error_stats=r["errorStats"], early_aborted=r["earlyAborted"],
                                 hashrate_std=r["hashrateStd"], fan_speed=r["averageFanSpeed"],
                                 fan_rpm=r["averageFanRpm"], thermally_settled=r["thermallySettled"],
-                                temp_slope=r["tempSlope"])
+                                temp_slope=r["tempSlope"], inconclusive=r["inconclusive"])
             save_results()
             return res, r["reason"]
         if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
@@ -1371,7 +1493,7 @@ def main():
     global bitaxe_ip, initial_voltage, initial_frequency, benchmark_time
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
     global max_temp, system_reset_done, voltage_increment, frequency_increment, check_mode
-    global thermal_margin, soak_minutes, bracket_enabled
+    global thermal_margin, soak_minutes, bracket_enabled, selection_prefer, extend_on_variance
 
     # On Windows, this call turns on ANSI escape processing so the colored output
     # renders in the classic console (Windows Terminal already supports it).
@@ -1393,6 +1515,8 @@ def main():
     thermal_margin = args.thermal_margin
     soak_minutes = args.soak
     bracket_enabled = args.bracket
+    selection_prefer = args.prefer
+    extend_on_variance = not args.no_extend_variance
     if args.benchmark_time is not None:
         benchmark_time = args.benchmark_time
     elif args.check:
