@@ -12,6 +12,8 @@ This is an error-aware fork of [mrv777/Bitaxe-Hashrate-Benchmark](https://github
 - **`refine` mode**: rescue an unstable ASIC. It sweeps voltage up to the lowest setting that clears the ceiling, then probes down for a lower-voltage setting that still passes (better J/TH). If the chip hits the temperature ceiling before the error clears, it lowers the frequency and retries, since frequency is the effective lever once cooling is the limit. Combinations that clearly can't clear the ceiling are stopped early (and still recorded) to save time.
 - **`efficiency` mode**: for a healthy miner. It holds the frequency and lowers voltage from the current setting to the lowest voltage that still clears the ceiling, cutting power and heat with no loss of hashrate.
 - **Robustness**: settings are read back and confirmed after each apply, so a failed PATCH or watchdog reboot can't mislabel a result. During the post-apply stabilization wait the device is monitored, so a combo that is already over the temperature/power limit is dropped before the sample window is wasted (and refine treats it as a reason to lower frequency). A dropped request retries once instead of ending the run. The gate uses a light trimmed mean and records the spread (`std`/`min`/`max`) so one noisy sample won't flip a borderline result.
+- **Adaptive window for noisy chips** (on by default; `--no-extend-variance` to turn off): some BM1370 chips swing their rolling error rate several points sample to sample, so a fixed window can land a borderline combo on either side of the ceiling by luck. When a combo's trimmed error mean sits within a confidence band of the ceiling (the standard error of the mean, taken over the same trimmed set so a single spike doesn't widen it), the window is extended a few samples at a time up to a cap, until the mean is confidently above or below the gate. A combo still uncertain at the cap is flagged `inconclusive`, so a borderline verdict is reported honestly rather than as a coin-flip. Clean combos and clear fails are unaffected and run the normal fixed window.
+- **Selection preference** (`--prefer efficiency|hashrate`): among the settings that pass the error and thermal gates, order the winner by lowest J/TH (default) or by highest hashrate. Use `hashrate` when raw output matters more than power, so a faster setting that also passes can win over a leaner but slower one.
 - **Thermal-aware selection**: a winner must average below `--max-temp` by a margin (a short window can settle just under the cap while true steady state runs hotter), VR temperature is a first-class limit alongside chip temp, and combos still heating at window end are flagged `thermallySettled: false`. Optional `--soak` watches the applied setting at steady state and warns if it drifts over. The tool also calls out **cooling-limited hardware** (fan pegged while the chip stays pinned near the cap) that tuning cannot fix, and refine stops walking such a unit down to the floor.
 - **Configurable chip-temp cutoff** (`--max-temp`): BM1370/Gamma boards often idle near 65°C and need 68 to leave room to raise voltage.
 - **CSV export and a ranked summary** (highest hashrate, most efficient, lowest error) alongside the existing JSON.
@@ -101,6 +103,8 @@ Optional parameters:
 - `--thermal-margin <C>`: require a winner to average this far below `--max-temp` for steady-state headroom (default: 1.5)
 - `--soak <min>`: after applying the best setting, watch it at steady state for this long and warn if temp/error drift over (0 = off; recommended for `refine`)
 - `--bracket`: in `refine`, also test one frequency step below a passing frequency and pick whichever is more efficient
+- `--prefer {efficiency,hashrate}`: among settings that pass the gates, order the winner by lowest J/TH (default) or highest hashrate
+- `--no-extend-variance`: use a fixed window even when a borderline, noisy combo's pass/fail verdict is statistically uncertain (the adaptive extension is on by default)
 - `--no-error-gate`: report the error rate but do not use it to gate selection
 - `--resume`: reload prior results for this IP and skip already-tested combos
 - `--benchmark-time <s>`: override the per-combo window in seconds (default: 600)
@@ -209,6 +213,8 @@ The script includes several configurable parameters:
 
 The device's `errorPercentage` is a noisy rolling rate, not a cumulative ratio, and it can swing from sample to sample. The per-combo figure is an average of `errorPercentage` across the stable window (warmup samples excluded), which reproduces the number AxeOS reports. With 5 or more samples it uses a light trimmed mean (dropping one extreme at each end) so a single noisy sample won't push a borderline combo over the ceiling, and the spread (`std`/`min`/`max`) is recorded alongside it. The raw `errorCount` delta over the fixed-length window is recorded separately as `errorCountDelta`, a comparable measure of error volume. If a device does not expose error data, the error rate is reported as unknown, a one-time notice is printed, and it never disqualifies a combination.
 
+Because that rate is noisy, a fixed window can decide a borderline combo by luck. When the trimmed mean lands within one standard error of the ceiling (the standard error taken over the same trimmed set, so a lone spike doesn't widen it), the window is extended a few samples at a time up to a cap until the mean is confidently on one side of the gate (`--no-extend-variance` disables this). A combo still uncertain at the cap is recorded as `inconclusive`. A chip that swings, say, 2-6% around a 3.5% ceiling then gets a verdict backed by more samples rather than by where the window happened to end.
+
 ## Output
 
 Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` and `.csv`, containing:
@@ -222,7 +228,7 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
   - Power efficiency metrics (J/TH)
   - Error rate (`errorRate`) with its dispersion (`errorRateStd`) and raw hardware errors over the window (`errorCountDelta`)
   - Whether it stayed within the error ceiling (`passedErrorGate`) and held hashrate in tolerance (`hashrateWithinTolerance`)
-  - Whether the window was stopped early as clearly-failing (`earlyAborted`)
+  - Whether the window was stopped early as clearly-failing (`earlyAborted`), or extended and still statistically borderline at the cap (`inconclusive`)
   - Voltage/frequency combinations tested
 
 ## Safety Features
@@ -231,7 +237,7 @@ Results are saved to `bitaxe_benchmark_results_<ip_address>_<timestamp>.json` an
 - Thermal-margin gate: a winning setting must average below the chip and VR cutoffs by a margin, so a setting that only passed a short window is not applied and then found to run hotter at steady state
 - Cooling-limited detection: when the fan is pegged and the chip stays pinned near the cap, the tool reports degraded cooling and refine stops walking the frequency down (tuning can't fix a cooling fault)
 - Voltage regulator (VR) temperature monitoring with safety cutoff (86°C)
-- Input voltage monitoring with minimum threshold (4800mV) and maximum threshold (5500mV)
+- Input voltage monitoring (4800-5500mV): a single out-of-range reading is treated as a post-reboot ramp transient and skipped, but a run of consecutive out-of-range readings is a real supply problem and fails the combo fast rather than burning the whole window
 - Power consumption monitoring with safety cutoff (40W)
 - Transient warmup readings (temp/voltage/hashrate not ready after a reboot) are skipped, not treated as failures
 - Implausible hashrate readings (far above the theoretical maximum, seen on unstable chips) are skipped so they can't pollute the average or the rankings
