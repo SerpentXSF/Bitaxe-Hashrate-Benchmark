@@ -162,7 +162,7 @@ def sum_shares_rejected(info):
     if not isinstance(info, dict):
         return None
     v = info.get("sharesRejected")
-    return int(v) if isinstance(v, (int, float)) else None
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
 def parse_rejected_reasons(info):
@@ -174,17 +174,16 @@ def parse_rejected_reasons(info):
     if not isinstance(info, dict):
         return None
     reasons = info.get("sharesRejectedReasons")
-    if reasons is None:
-        return None
+    if not isinstance(reasons, list):
+        return None   # absent or malformed (non-list) - treat as unsupported
     out = {}
-    if isinstance(reasons, list):
-        for item in reasons:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("message") or item.get("reason") or "unknown"
-            count = item.get("count")
-            if isinstance(count, (int, float)):
-                out[name] = out.get(name, 0) + int(count)
+    for item in reasons:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("message") or item.get("reason") or "unknown"
+        count = item.get("count")
+        if isinstance(count, (int, float)) and not isinstance(count, bool):
+            out[name] = out.get(name, 0) + int(count)
     return out
 
 
@@ -200,13 +199,20 @@ def resolve_expected_hashrate(fw_readings, computed):
     firmware reading is only trusted within 0.5x-2x of the computed expectation.
     `fw_readings` is the list of per-sample firmware readings (or None). Returns
     (basis, source, fw_median) with source 'firmware' or 'computed'."""
-    nums = sorted(v for v in (fw_readings or []) if isinstance(v, (int, float)) and v > 0)
+    nums = sorted(v for v in (fw_readings or [])
+                  if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0)
     if not nums:
         return computed, 'computed', None
-    mid = nums[len(nums) // 2]   # median - robust to a stray warmup reading
-    if computed > 0 and not (0.5 * computed <= mid <= 2.0 * computed):
-        return computed, 'computed', mid
-    return mid, 'firmware', mid
+    # Lower-middle for an even count, so a stray high reading can't bias the basis
+    # upward: a stale post-reboot sample reflects the OLD frequency, and in refine
+    # mode the frequency steps DOWN, so stale readings read high.
+    mid = nums[(len(nums) - 1) // 2]
+    # Only trust the firmware value when there's a valid computed expectation to
+    # sanity-check it against and it lands within 0.5x-2x of it; otherwise keep the
+    # deterministic computed basis (still reporting what firmware said).
+    if computed > 0 and 0.5 * computed <= mid <= 2.0 * computed:
+        return mid, 'firmware', mid
+    return computed, 'computed', mid
 
 
 def _trimmed_error_values(samples):
@@ -342,17 +348,20 @@ def window_rejected_reasons(samples):
     maps = [s['rejected_reasons'] for s in samples if s.get('rejected_reasons') is not None]
     if not maps:
         return None
-    first_seen, last_seen = {}, {}
+    # Per reason, sum consecutive positive rises (the same reset-safe method as
+    # window_rejected_delta). A reason absent from the previous map counts as 0
+    # there, so one that first appears mid-window with count N attributes all N to
+    # this window - AxeOS only lists a reason once it has occurred. This keeps the
+    # breakdown's total consistent with window_rejected_delta, and a mid-window
+    # counter reset (a decrease) contributes nothing rather than going negative.
+    out, prev = {}, None
     for rmap in maps:
-        for reason, count in rmap.items():
-            if reason not in first_seen:
-                first_seen[reason] = count
-            last_seen[reason] = count
-    out = {}
-    for reason, last in last_seen.items():
-        delta = last - first_seen.get(reason, 0)
-        if delta > 0:
-            out[reason] = delta
+        if prev is not None:
+            for reason, count in rmap.items():
+                rise = count - prev.get(reason, 0)
+                if rise > 0:
+                    out[reason] = out.get(reason, 0) + rise
+        prev = rmap
     return out
 
 
@@ -789,9 +798,13 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     # Prefer the firmware's own `expectedHashrate` over the tool's formula for the
     # hashrate-tolerance basis (they agree today, but this tracks a firmware core-
     # count change automatically); fall back to the computed value when absent or
-    # implausible. The tolerance threshold and its 0.94 factor are unchanged.
+    # implausible. The tolerance threshold and its 0.94 factor are unchanged. The
+    # firmware readings are warmup-trimmed like every other metric so a stale
+    # post-reboot expectedHashrate can't skew the basis.
+    fw_all = fw_expected_readings or []
+    fw_post = fw_all[warmup_samples:] if len(fw_all) > warmup_samples else fw_all
     expected_basis, expected_source, fw_expected = resolve_expected_hashrate(
-        fw_expected_readings, expected_hashrate)
+        fw_post, expected_hashrate)
 
     # If the pass/fail verdict is still statistically uncertain at the final (possibly
     # extended) window - a noisy combo straddling the ceiling that the extension could
@@ -1059,7 +1072,7 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "expectedHashrateFw": expected_hashrate_fw,
         "expectedHashrateSource": expected_hashrate_source,
     }
-    if rejected_reasons:
+    if rejected_reasons is not None:
         result["rejectedReasons"] = rejected_reasons
     if error_stats is not None:
         result["errorRateStd"] = error_stats.get("std")

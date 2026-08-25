@@ -164,10 +164,21 @@ class TestWindowRejected(unittest.TestCase):
         self.assertIsNone(b.window_rejected_delta([sample(None, 2.0), sample(None, 2.0)]))
 
     def test_reasons_breakdown_by_growth(self):
+        # "low diff" first appears mid-window at count 2 -> those 2 accrued in-window
+        # (AxeOS only lists a reason once it occurs), so it must be counted, and the
+        # breakdown total must match window_rejected_delta.
         s = [sample(None, 2.0, rr={"stale": 1}),
              sample(None, 2.0, rr={"stale": 1, "low diff": 2}),
              sample(None, 2.0, rr={"stale": 4, "low diff": 2})]
-        self.assertEqual(b.window_rejected_reasons(s), {"stale": 3})   # low diff didn't grow
+        self.assertEqual(b.window_rejected_reasons(s), {"stale": 3, "low diff": 2})
+
+    def test_reasons_reset_safe(self):
+        # stale resets mid-window (10 -> reboot -> 0 -> 3): count only the +3 after
+        # the reset, never a negative from the decrease.
+        s = [sample(None, 2.0, rr={"stale": 10}),
+             sample(None, 2.0, rr={"stale": 0}),
+             sample(None, 2.0, rr={"stale": 3})]
+        self.assertEqual(b.window_rejected_reasons(s), {"stale": 3})
 
     def test_reasons_none_without_data(self):
         self.assertIsNone(b.window_rejected_reasons([sample(None, 2.0), sample(None, 2.0)]))
@@ -409,6 +420,15 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         r = self._run(make_info(exp=1071))
         self.assertEqual(r["expectedHashrateSource"], "firmware")
         self.assertAlmostEqual(r["expectedHashrateFw"], 1071)
+
+    def test_firmware_basis_actually_drives_tolerance(self):
+        # fw expected (1140) is in-band but higher than computed (1071). A hashrate of
+        # 1040 passes tolerance vs computed (>= 1071*0.94 = 1006.7) but fails vs the
+        # firmware basis (>= 1140*0.94 = 1071.6) - proving the tolerance uses the fw
+        # value, not just that the source label changed.
+        r = self._run(make_info(hr=1040, exp=1140))
+        self.assertEqual(r["expectedHashrateSource"], "firmware")
+        self.assertFalse(r["hashrateWithinTolerance"])
 
     def test_captures_pool_rejects_and_reasons(self):
         # sharesRejected climbs across the window; reasons explain the growth.
