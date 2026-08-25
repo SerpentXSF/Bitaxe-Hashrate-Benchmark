@@ -14,17 +14,27 @@ import bitaxe_hashrate_benchmark as b
 
 
 def make_info(temp=55, hr=1200, power=18, vr=60, ep=2.0, ec=1000, voltage=5000,
-              fanspeed=80, fanrpm=5000):
-    return {
+              fanspeed=80, fanrpm=5000, sr=None, srr=None, exp=None):
+    info = {
         "temp": temp, "vrTemp": vr, "voltage": voltage,
         "hashRate": hr, "power": power, "errorPercentage": ep,
         "hashrateMonitor": {"asics": [{"errorCount": ec}]},
         "fanspeed": fanspeed, "fanrpm": fanrpm,
     }
+    # New AxeOS telemetry - included only when the test asks for it, so existing
+    # tests keep exercising the older-firmware (field-absent) path.
+    if sr is not None:
+        info["sharesRejected"] = sr
+    if srr is not None:
+        info["sharesRejectedReasons"] = srr
+    if exp is not None:
+        info["expectedHashrate"] = exp
+    return info
 
 
-def sample(ec, ep):
-    return {"error_count": ec, "error_percentage": ep}
+def sample(ec, ep, sr=None, rr=None):
+    return {"error_count": ec, "error_percentage": ep,
+            "shares_rejected": sr, "rejected_reasons": rr}
 
 
 class TestSumErrorCount(unittest.TestCase):
@@ -78,6 +88,89 @@ class TestWindowErrorCount(unittest.TestCase):
 
     def test_missing_counts_returns_none(self):
         self.assertIsNone(b.window_error_count([sample(None, 5.0), sample(None, 3.0)]))
+
+
+class TestSumSharesRejected(unittest.TestCase):
+    def test_reads_cumulative_int(self):
+        self.assertEqual(b.sum_shares_rejected({"sharesRejected": 7}), 7)
+
+    def test_zero_is_zero_not_none(self):
+        self.assertEqual(b.sum_shares_rejected({"sharesRejected": 0}), 0)
+
+    def test_missing_is_none(self):
+        self.assertIsNone(b.sum_shares_rejected({"hashRate": 1200}))
+
+    def test_non_dict_is_none(self):
+        self.assertIsNone(b.sum_shares_rejected(None))
+
+
+class TestParseRejectedReasons(unittest.TestCase):
+    def test_message_key(self):
+        info = {"sharesRejectedReasons": [{"message": "Job not found", "count": 3},
+                                          {"message": "Above target", "count": 1}]}
+        self.assertEqual(b.parse_rejected_reasons(info),
+                         {"Job not found": 3, "Above target": 1})
+
+    def test_reason_key_alias(self):
+        info = {"sharesRejectedReasons": [{"reason": "stale", "count": 2}]}
+        self.assertEqual(b.parse_rejected_reasons(info), {"stale": 2})
+
+    def test_empty_list_is_empty_dict_not_none(self):
+        # Present-but-empty (supported, no rejects) must be distinct from absent.
+        self.assertEqual(b.parse_rejected_reasons({"sharesRejectedReasons": []}), {})
+
+    def test_absent_is_none(self):
+        self.assertIsNone(b.parse_rejected_reasons({"hashRate": 1200}))
+
+
+class TestResolveExpectedHashrate(unittest.TestCase):
+    def test_prefers_firmware_when_present(self):
+        basis, source, fw = b.resolve_expected_hashrate([1071.0, 1071.0], 1071.0)
+        self.assertEqual(source, "firmware")
+        self.assertAlmostEqual(basis, 1071.0)
+        self.assertAlmostEqual(fw, 1071.0)
+
+    def test_uses_median_of_readings(self):
+        basis, source, _ = b.resolve_expected_hashrate([1000.0, 1071.0, 1080.0], 1071.0)
+        self.assertEqual(source, "firmware")
+        self.assertAlmostEqual(basis, 1071.0)   # median, robust to a stray reading
+
+    def test_falls_back_when_absent(self):
+        basis, source, fw = b.resolve_expected_hashrate([], 1071.0)
+        self.assertEqual(source, "computed")
+        self.assertAlmostEqual(basis, 1071.0)
+        self.assertIsNone(fw)
+
+    def test_rejects_implausible_warmup_reading(self):
+        # A post-reboot sample reflecting a much lower old frequency is out of the
+        # 0.5x-2x band -> keep the computed basis, but still report what firmware said.
+        basis, source, fw = b.resolve_expected_hashrate([300.0], 1071.0)
+        self.assertEqual(source, "computed")
+        self.assertAlmostEqual(basis, 1071.0)
+        self.assertAlmostEqual(fw, 300.0)
+
+
+class TestWindowRejected(unittest.TestCase):
+    def test_delta_of_cumulative_rejects(self):
+        s = [sample(None, 2.0, sr=5), sample(None, 2.0, sr=5), sample(None, 2.0, sr=8)]
+        self.assertEqual(b.window_rejected_delta(s), 3)
+
+    def test_reset_safe(self):
+        # Reboot mid-window (8 -> 0): skip the decrease, count the +2 after.
+        s = [sample(None, 2.0, sr=8), sample(None, 2.0, sr=0), sample(None, 2.0, sr=2)]
+        self.assertEqual(b.window_rejected_delta(s), 2)
+
+    def test_delta_none_without_data(self):
+        self.assertIsNone(b.window_rejected_delta([sample(None, 2.0), sample(None, 2.0)]))
+
+    def test_reasons_breakdown_by_growth(self):
+        s = [sample(None, 2.0, rr={"stale": 1}),
+             sample(None, 2.0, rr={"stale": 1, "low diff": 2}),
+             sample(None, 2.0, rr={"stale": 4, "low diff": 2})]
+        self.assertEqual(b.window_rejected_reasons(s), {"stale": 3})   # low diff didn't grow
+
+    def test_reasons_none_without_data(self):
+        self.assertIsNone(b.window_rejected_reasons([sample(None, 2.0), sample(None, 2.0)]))
 
 
 class TestGate(unittest.TestCase):
@@ -304,6 +397,26 @@ class TestBenchmarkIterationResult(unittest.TestCase):
         self.assertEqual(r["averageFanSpeed"], 80)
         self.assertEqual(r["averageFanRpm"], 5000)
         self.assertIsNotNone(r["hashrateStd"])   # 0.0 for a flat feed, but present
+
+    def test_older_firmware_uses_computed_expected(self):
+        # No expectedHashrate field -> computed basis, and no reject data.
+        r = self._run(make_info())
+        self.assertEqual(r["expectedHashrateSource"], "computed")
+        self.assertIsNone(r["sharesRejectedDelta"])
+
+    def test_uses_firmware_expected_hashrate(self):
+        # computed = 525 * 2040/1000 = 1071; firmware reports the same -> firmware source.
+        r = self._run(make_info(exp=1071))
+        self.assertEqual(r["expectedHashrateSource"], "firmware")
+        self.assertAlmostEqual(r["expectedHashrateFw"], 1071)
+
+    def test_captures_pool_rejects_and_reasons(self):
+        # sharesRejected climbs across the window; reasons explain the growth.
+        seq = [make_info(sr=i, srr=[{"message": "stale", "count": i}]) for i in range(20)]
+        r = self._run(seq)
+        self.assertTrue(r["ok"])
+        self.assertGreater(r["sharesRejectedDelta"], 0)
+        self.assertEqual(list(r["rejectedReasons"].keys()), ["stale"])
 
     def test_thermal_guard(self):
         r = self._run(make_info(temp=99))

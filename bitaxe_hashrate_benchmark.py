@@ -155,6 +155,60 @@ def sum_error_count(info):
     return total if found else None
 
 
+def sum_shares_rejected(info):
+    """Cumulative pool-rejected share count from a /api/system/info payload (int),
+    or None if the field is absent (older firmware). This is a pool-side signal -
+    shares the upstream refused - independent of the ASIC hardware error rate."""
+    if not isinstance(info, dict):
+        return None
+    v = info.get("sharesRejected")
+    return int(v) if isinstance(v, (int, float)) else None
+
+
+def parse_rejected_reasons(info):
+    """Map {reason: cumulative_count} from AxeOS `sharesRejectedReasons` (a list of
+    {message|reason, count}), or None when the field is absent. An empty list (no
+    rejects yet) returns {} - present-but-empty, deliberately distinct from None so
+    a device that supports the field but has no rejects isn't mistaken for one that
+    can't report it at all."""
+    if not isinstance(info, dict):
+        return None
+    reasons = info.get("sharesRejectedReasons")
+    if reasons is None:
+        return None
+    out = {}
+    if isinstance(reasons, list):
+        for item in reasons:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("message") or item.get("reason") or "unknown"
+            count = item.get("count")
+            if isinstance(count, (int, float)):
+                out[name] = out.get(name, 0) + int(count)
+    return out
+
+
+def resolve_expected_hashrate(fw_readings, computed):
+    """Choose the expected-hashrate basis for the hashrate-tolerance gate.
+
+    AxeOS now reports `expectedHashrate` directly (the same frequency x core-count
+    / 1000 the tool computes), so prefer that firmware-blessed value - a future
+    ASIC or core-count change then tracks the firmware automatically instead of
+    silently diverging from a hard-coded formula. Falls back to the computed value
+    when the device doesn't report it, or when the reported value is implausible: a
+    warmup sample right after a reboot can briefly reflect the OLD frequency, so a
+    firmware reading is only trusted within 0.5x-2x of the computed expectation.
+    `fw_readings` is the list of per-sample firmware readings (or None). Returns
+    (basis, source, fw_median) with source 'firmware' or 'computed'."""
+    nums = sorted(v for v in (fw_readings or []) if isinstance(v, (int, float)) and v > 0)
+    if not nums:
+        return computed, 'computed', None
+    mid = nums[len(nums) // 2]   # median - robust to a stray warmup reading
+    if computed > 0 and not (0.5 * computed <= mid <= 2.0 * computed):
+        return computed, 'computed', mid
+    return mid, 'firmware', mid
+
+
 def _trimmed_error_values(samples):
     """The post-warmup error-percentage readings with one extreme dropped at each
     end when there are enough (>=5) - the exact set the trimmed mean is taken over.
@@ -260,6 +314,46 @@ def window_error_count(samples):
             total += cur - prev
         # a decrease means the counter reset; skip that step rather than count it
     return total
+
+
+def window_rejected_delta(samples):
+    """Pool-rejected shares accrued across a window's samples, summing consecutive
+    positive deltas so a mid-window reboot (counter reset) doesn't produce a bogus
+    negative. Returns an int, or None if the device doesn't report a rejected-share
+    count. A non-zero value is a real stability signal - the upstream pool refused
+    work while this combo ran - orthogonal to the ASIC hardware error rate."""
+    counts = [s['shares_rejected'] for s in samples if s.get('shares_rejected') is not None]
+    if len(counts) < 2:
+        return None
+    total = 0
+    for prev, cur in zip(counts, counts[1:]):
+        if cur >= prev:
+            total += cur - prev
+    return total
+
+
+def window_rejected_reasons(samples):
+    """Per-reason breakdown of the pool rejects accrued across the window: for each
+    reason AxeOS reported, the rise in its cumulative count from the first sample
+    that carried it to the last (clamped at 0 so a mid-window counter reset can't go
+    negative). Returns a {reason: delta} dict limited to reasons that actually grew,
+    or None when the device exposes no reason data. Diagnostic only - it explains
+    *why* window_rejected_delta moved (stale job, low difficulty, duplicate...)."""
+    maps = [s['rejected_reasons'] for s in samples if s.get('rejected_reasons') is not None]
+    if not maps:
+        return None
+    first_seen, last_seen = {}, {}
+    for rmap in maps:
+        for reason, count in rmap.items():
+            if reason not in first_seen:
+                first_seen[reason] = count
+            last_seen[reason] = count
+    out = {}
+    for reason, last in last_seen.items():
+        delta = last - first_seen.get(reason, 0)
+        if delta > 0:
+            out[reason] = delta
+    return out
 
 
 def passes_error_gate(error_rate, ceiling):
@@ -604,6 +698,10 @@ def _iter_result(ok=False, reason=None, **kw):
         "errorRate": None,
         "errorCountDelta": None,
         "errorStats": None,
+        "sharesRejectedDelta": None,
+        "rejectedReasons": None,
+        "expectedHashrateFw": None,
+        "expectedHashrateSource": None,
         "hashrateStd": None,
         "averageFanSpeed": None,
         "averageFanRpm": None,
@@ -634,7 +732,7 @@ def _warn_no_error_data():
 
 def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
                      error_samples, expected_hashrate, fan_speeds=None, fan_rpms=None,
-                     early=False):
+                     early=False, fw_expected_readings=None):
     """Turn a window's collected samples into a result dict. Called both at
     end-of-window and on an early abort - so a marginal device that never clears
     the ceiling still leaves a recorded (partial) floor for select_best."""
@@ -685,6 +783,15 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     error_rate, error_method = compute_window_error(error_window)
     error_count_delta = window_error_count(error_window)
     error_stats = window_error_stats(error_window)
+    rejected_delta = window_rejected_delta(error_window)
+    rejected_reasons = window_rejected_reasons(error_window)
+
+    # Prefer the firmware's own `expectedHashrate` over the tool's formula for the
+    # hashrate-tolerance basis (they agree today, but this tracks a firmware core-
+    # count change automatically); fall back to the computed value when absent or
+    # implausible. The tolerance threshold and its 0.94 factor are unchanged.
+    expected_basis, expected_source, fw_expected = resolve_expected_hashrate(
+        fw_expected_readings, expected_hashrate)
 
     # If the pass/fail verdict is still statistically uncertain at the final (possibly
     # extended) window - a noisy combo straddling the ceiling that the extension could
@@ -692,11 +799,12 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     inconclusive = bool(error_gate_enabled and not early
                         and is_verdict_uncertain(error_window, max_error_rate, uncertainty_k))
 
-    hashrate_within_tolerance = (average_hashrate >= expected_hashrate * 0.94)
+    hashrate_within_tolerance = (average_hashrate >= expected_basis * 0.94)
 
     tag = " [early]" if early else ""
+    exp_note = " fw" if expected_source == 'firmware' else ""
     print(GREEN + f"Average Hashrate{tag}: {average_hashrate:.2f} GH/s (±{hashrate_std:.1f}, "
-                  f"Expected: {expected_hashrate:.2f} GH/s)" + RESET)
+                  f"Expected: {expected_basis:.2f} GH/s{exp_note})" + RESET)
     heating = "" if thermally_settled else f"  (still heating +{temp_slope:.2f}°C/min, not settled)"
     colour_t = GREEN if thermally_settled else YELLOW
     print(colour_t + f"Average Temperature: {average_temperature:.2f}°C{heating}" + RESET)
@@ -719,6 +827,17 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
     else:
         _warn_no_error_data()
 
+    # Pool-side rejects are a separate stability signal from the ASIC error rate:
+    # a combo can have a low hardware error rate yet get shares refused upstream
+    # (stale/low-difficulty/duplicate). Surface it as a diagnostic; it does not gate
+    # selection (rejects depend on the live pool, not just the V/F setting).
+    if rejected_delta:
+        breakdown = ""
+        if rejected_reasons:
+            breakdown = " - " + ", ".join(f"{n}x {r}" for r, n in
+                                          sorted(rejected_reasons.items(), key=lambda kv: -kv[1]))
+        print(YELLOW + f"Pool rejects: {rejected_delta} share(s) refused during this window{breakdown}" + RESET)
+
     return _iter_result(
         ok=True,
         reason=("EARLY_ABORT" if early else None),
@@ -730,6 +849,10 @@ def _finalize_window(hash_rates, temperatures, power_consumptions, vr_temps,
         errorRate=error_rate,
         errorCountDelta=error_count_delta,
         errorStats=error_stats,
+        sharesRejectedDelta=rejected_delta,
+        rejectedReasons=rejected_reasons,
+        expectedHashrateFw=fw_expected,
+        expectedHashrateSource=expected_source,
         hashrateStd=hashrate_std,
         averageFanSpeed=average_fan_speed,
         averageFanRpm=average_fan_rpm,
@@ -750,6 +873,7 @@ def benchmark_iteration(core_voltage, frequency):
     error_samples = []
     fan_speeds = []
     fan_rpms = []
+    fw_expected_readings = []
     total_samples = benchmark_time // sample_interval
     expected_hashrate = frequency * ((small_core_count * asic_count) / 1000)
     max_total_samples = total_samples + (variance_extend_cap if extend_on_variance else 0)
@@ -837,7 +961,12 @@ def benchmark_iteration(core_voltage, frequency):
         error_samples.append({
             "error_count": sum_error_count(info),
             "error_percentage": info.get("errorPercentage"),
+            "shares_rejected": sum_shares_rejected(info),
+            "rejected_reasons": parse_rejected_reasons(info),
         })
+        fw_exp = info.get("expectedHashrate")
+        if isinstance(fw_exp, (int, float)) and fw_exp > 0:
+            fw_expected_readings.append(fw_exp)
         fan_speed = info.get("fanspeed")
         fan_rpm = info.get("fanrpm")
         if fan_speed is not None:
@@ -880,7 +1009,8 @@ def benchmark_iteration(core_voltage, frequency):
                             f"{max_error_rate:.1f}%); aborting combo early." + RESET)
                 return _finalize_window(hash_rates, temperatures, power_consumptions,
                                         vr_temps, error_samples, expected_hashrate,
-                                        fan_speeds, fan_rpms, early=True)
+                                        fan_speeds, fan_rpms, early=True,
+                                        fw_expected_readings=fw_expected_readings)
 
         # Adaptive extension: at the last planned sample, if the pass/fail verdict is
         # still statistically uncertain (a noisy combo hovering near the ceiling),
@@ -900,14 +1030,16 @@ def benchmark_iteration(core_voltage, frequency):
 
     return _finalize_window(hash_rates, temperatures, power_consumptions,
                             vr_temps, error_samples, expected_hashrate,
-                            fan_speeds, fan_rpms, early=False)
+                            fan_speeds, fan_rpms, early=False,
+                            fw_expected_readings=fw_expected_readings)
 
 
 def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jth,
                   avg_vr_temp, error_rate, error_count_delta=None, hashrate_ok=True,
                   error_stats=None, early_aborted=False, hashrate_std=None,
                   fan_speed=None, fan_rpm=None, thermally_settled=True, temp_slope=None,
-                  inconclusive=False):
+                  inconclusive=False, shares_rejected_delta=None, rejected_reasons=None,
+                  expected_hashrate_fw=None, expected_hashrate_source=None):
     result = {
         "coreVoltage": core_voltage,
         "frequency": frequency,
@@ -923,7 +1055,12 @@ def record_result(core_voltage, frequency, avg_hashrate, avg_temp, efficiency_jt
         "tempSlope": temp_slope,
         "inconclusive": inconclusive,
         "earlyAborted": early_aborted,
+        "sharesRejectedDelta": shares_rejected_delta,
+        "expectedHashrateFw": expected_hashrate_fw,
+        "expectedHashrateSource": expected_hashrate_source,
     }
+    if rejected_reasons:
+        result["rejectedReasons"] = rejected_reasons
     if error_stats is not None:
         result["errorRateStd"] = error_stats.get("std")
         result["errorRateMin"] = error_stats.get("min")
@@ -996,7 +1133,8 @@ def save_csv():
     try:
         filename = results_filename("csv")
         fields = ["coreVoltage", "frequency", "averageHashRate", "hashrateStd", "efficiencyJTH",
-                  "errorRate", "errorRateStd", "errorCountDelta", "passedErrorGate", "inconclusive",
+                  "errorRate", "errorRateStd", "errorCountDelta", "sharesRejectedDelta",
+                  "expectedHashrateSource", "passedErrorGate", "inconclusive",
                   "hashrateWithinTolerance", "thermallySettled", "tempSlope", "earlyAborted",
                   "averageTemperature", "averageVRTemp", "averageFanSpeed", "averageFanRpm"]
         with open(filename, "w", newline="") as f:
@@ -1103,6 +1241,10 @@ def save_final_json():
             "errorRate": r.get("errorRate"),
             "errorRateStd": r.get("errorRateStd"),
             "errorCountDelta": r.get("errorCountDelta"),
+            "sharesRejectedDelta": r.get("sharesRejectedDelta"),
+            "rejectedReasons": r.get("rejectedReasons"),
+            "expectedHashrateFw": r.get("expectedHashrateFw"),
+            "expectedHashrateSource": r.get("expectedHashrateSource"),
             "passedErrorGate": r.get("passedErrorGate"),
             "inconclusive": r.get("inconclusive", False),
             "hashrateWithinTolerance": r.get("hashrateWithinTolerance"),
@@ -1155,7 +1297,11 @@ def run_combo(voltage, frequency):
                                 error_stats=r["errorStats"], early_aborted=r["earlyAborted"],
                                 hashrate_std=r["hashrateStd"], fan_speed=r["averageFanSpeed"],
                                 fan_rpm=r["averageFanRpm"], thermally_settled=r["thermallySettled"],
-                                temp_slope=r["tempSlope"], inconclusive=r["inconclusive"])
+                                temp_slope=r["tempSlope"], inconclusive=r["inconclusive"],
+                                shares_rejected_delta=r["sharesRejectedDelta"],
+                                rejected_reasons=r["rejectedReasons"],
+                                expected_hashrate_fw=r["expectedHashrateFw"],
+                                expected_hashrate_source=r["expectedHashrateSource"])
             save_results()
             return res, r["reason"]
         if r["reason"] == "SYSTEM_INFO_FAILURE" and attempt == 0:
@@ -1414,11 +1560,18 @@ def run_check():
         rpm = f", {r['averageFanRpm']:.0f} RPM" if r["averageFanRpm"] is not None else ""
         fan = f"\n  Fan:        {r['averageFanSpeed']:.0f}%{rpm}"
     settled = "" if r.get("thermallySettled", True) else "  (still heating - not thermally settled)"
+    rej = ""
+    rd = r.get("sharesRejectedDelta")
+    if rd:
+        rr = r.get("rejectedReasons")
+        why = (" - " + ", ".join(f"{n}x {reason}" for reason, n in
+                                 sorted(rr.items(), key=lambda kv: -kv[1]))) if rr else ""
+        rej = f"\n  Rejects:    {rd} pool share(s) refused this window{why}"
     print(GREEN + f"\nCurrent setting: {voltage}mV / {frequency}MHz{partial}\n"
                   f"  Hashrate:   {r['averageHashRate']:.1f} GH/s{hstd}\n"
                   f"  Efficiency: {r['efficiencyJTH']:.2f} J/TH\n"
                   f"  Error:      {er} [{gate} @ {max_error_rate:.1f}%]\n"
-                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}{settled}{fan}" + RESET)
+                  f"  Temp:       {r['averageTemperature']:.1f}°C{vr}{settled}{fan}{rej}" + RESET)
     print_cooling_verdict([r])
     return True
 
