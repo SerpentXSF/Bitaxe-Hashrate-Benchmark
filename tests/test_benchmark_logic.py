@@ -882,5 +882,55 @@ class TestExtendOnVariance(unittest.TestCase):
         self.assertEqual(calls, 20)         # fixed window even though noisy/borderline
 
 
+class VRTemperatureCeiling(unittest.TestCase):
+    """The VR ceiling is configurable, and it binds independently of the chip cap.
+
+    On some boards the regulator is the hot part, not the die: a GammaX5 held its
+    chip under 50C while its VRM climbed from 53C to 68C, so a chip-only reading
+    of "plenty of headroom" was wrong. These pin the VR gate down."""
+
+    def test_vr_over_ceiling_minus_margin_fails(self):
+        # 70 - 4 = 66, so a 68C average VR must not pass.
+        res = {'averageTemperature': 48.0, 'averageVRTemp': 68.0}
+        self.assertFalse(b.passes_thermal(res, 68, 1.5, 70, 4.0))
+
+    def test_cool_chip_does_not_rescue_a_hot_vr(self):
+        # The die is 20C under its cap; the regulator alone must still fail it.
+        res = {'averageTemperature': 45.0, 'averageVRTemp': 69.0}
+        self.assertFalse(b.passes_thermal(res, 66, 1.5, 70, 4.0))
+
+    def test_default_ceiling_admits_a_hot_vr(self):
+        # Documents why this needed a knob: at the 86C default, 68C sails through.
+        res = {'averageTemperature': 48.0, 'averageVRTemp': 68.0}
+        self.assertTrue(b.passes_thermal(res, 68, 1.5, 86, 4.0))
+
+    def test_vr_within_margin_passes(self):
+        res = {'averageTemperature': 48.0, 'averageVRTemp': 63.0}
+        self.assertTrue(b.passes_thermal(res, 68, 1.5, 70, 4.0))
+
+    def test_missing_vr_reading_does_not_disqualify(self):
+        # Boards that report no vrTemp must not be failed for silence.
+        res = {'averageTemperature': 48.0}
+        self.assertTrue(b.passes_thermal(res, 68, 1.5, 70, 4.0))
+
+    def test_hot_chip_still_fails_independently(self):
+        res = {'averageTemperature': 67.0, 'averageVRTemp': 50.0}
+        self.assertFalse(b.passes_thermal(res, 68, 1.5, 70, 4.0))
+
+    def test_cli_exposes_vr_ceiling_and_margin(self):
+        argv = ['prog', '1.2.3.4', '--max-vr-temp', '70', '--vr-margin', '2']
+        with mock.patch.object(sys, 'argv', argv):
+            args = b.parse_arguments()
+        self.assertEqual(args.max_vr_temp, 70)
+        self.assertEqual(args.vr_margin, 2.0)
+
+    def test_cli_defaults_match_module_constants(self):
+        # The flag's default must not silently differ from the module constant,
+        # or an unflagged run would gate differently than the code documents.
+        with mock.patch.object(sys, 'argv', ['prog', '1.2.3.4']):
+            args = b.parse_arguments()
+        self.assertEqual(args.max_vr_temp, b.max_vr_temp)
+        self.assertEqual(args.vr_margin, b.vr_margin)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

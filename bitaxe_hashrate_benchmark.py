@@ -105,6 +105,14 @@ def parse_arguments():
     parser.add_argument('--thermal-margin', type=float, default=1.5,
                         help='Require a passing combo to average this many C below --max-temp, '
                              'for steady-state headroom (default: 1.5)')
+    parser.add_argument('--max-vr-temp', type=int, default=86,
+                        help='Voltage-regulator temperature ceiling in C (default: 86). '
+                             'On some boards the VRM is the binding constraint rather than '
+                             'the die, so the chip can sit well under its own cap while the '
+                             'regulator climbs.')
+    parser.add_argument('--vr-margin', type=float, default=4.0,
+                        help='Require average VR temp <= max-vr-temp minus this '
+                             'to pass (default: 4.0)')
     parser.add_argument('--soak', type=int, default=0,
                         help='After applying the best setting, watch it at steady state for this many '
                              'minutes and warn if temp/error drift over (0 = off; useful for refine)')
@@ -1660,6 +1668,7 @@ def main():
     global max_error_rate, error_gate_enabled, benchmark_mode, resume_enabled
     global max_temp, system_reset_done, voltage_increment, frequency_increment, check_mode
     global thermal_margin, soak_minutes, bracket_enabled, selection_prefer, extend_on_variance
+    global max_vr_temp, vr_margin
 
     # On Windows, this call turns on ANSI escape processing so the colored output
     # renders in the classic console (Windows Terminal already supports it).
@@ -1679,6 +1688,8 @@ def main():
     benchmark_mode = args.mode
     resume_enabled = args.resume
     thermal_margin = args.thermal_margin
+    max_vr_temp = args.max_vr_temp
+    vr_margin = args.vr_margin
     soak_minutes = args.soak
     bracket_enabled = args.bracket
     selection_prefer = args.prefer
@@ -1733,7 +1744,11 @@ def main():
         print(f"  Mode:       {benchmark_mode}")
         print(f"  Start:      {initial_voltage}mV / {initial_frequency}MHz")
         print(f"  Steps:      {voltage_increment}mV voltage, {frequency_increment}MHz frequency")
-        print(f"  Ceilings:   {max_error_rate:.1f}% error, {max_temp}°C chip")
+        # Show the VR ceiling too. It is a real gate, and one that can bind before
+        # the chip cap on boards where the regulator runs hotter than the die -
+        # leaving it unprinted is how a sweep gets pushed past it unnoticed.
+        print(f"  Ceilings:   {max_error_rate:.1f}% error, {max_temp}°C chip "
+              f"(-{thermal_margin}), {max_vr_temp}°C VR (-{vr_margin})")
         print(f"  Window:     {benchmark_time}s ({benchmark_time // sample_interval} samples, "
               f"{warmup_samples} warmup)")
         print(f"  Error gate: {'on' if error_gate_enabled else 'off'}")

@@ -103,6 +103,8 @@ Optional parameters:
 - `--max-error <pct>`: error-rate ceiling for selecting the best setting (default: 3.5)
 - `--max-temp <C>`: chip temperature cutoff (default: 66; BM1370/Gamma often need 68)
 - `--thermal-margin <C>`: require a winner to average this far below `--max-temp` for steady-state headroom (default: 1.5)
+- `--max-vr-temp <C>`: voltage-regulator cutoff (default: 86). On some boards the VRM, not the die, is the binding constraint - a GammaX5 held its chip under 50 C while the regulator climbed from 53 C to 68 C, so a chip-only reading of "plenty of headroom" was wrong. If the fan is already pegged and `VR` is climbing faster than `T` in the status line, lower this (70 is a sensible starting point for Gamma boards).
+- `--vr-margin <C>`: require a winner to average this far below `--max-vr-temp` (default: 4.0)
 - `--soak <min>`: after applying the best setting, watch it at steady state for this long and warn if temp/error drift over (0 = off; recommended for `refine`)
 - `--bracket`: in `refine`, also test one frequency step below a passing frequency and pick whichever is more efficient
 - `--prefer {efficiency,hashrate}`: among settings that pass the gates, order the winner by lowest J/TH (default) or highest hashrate
