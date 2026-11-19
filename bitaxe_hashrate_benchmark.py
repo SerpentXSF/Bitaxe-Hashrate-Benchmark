@@ -17,6 +17,47 @@ YELLOW = "\033[93m"
 RED = "\033[91m"
 RESET = "\033[0m"
 
+
+def enable_windows_ansi():
+    """Turn on ANSI escape processing for the classic Windows console.
+
+    Windows Terminal handles the codes above natively, but conhost does not
+    unless the console mode has ENABLE_VIRTUAL_TERMINAL_PROCESSING set, and
+    without it the output is littered with raw escape sequences.
+
+    This used to be done with the well-known `os.system("")` trick, which works
+    only as a side effect of spawning a shell. That cost a process for nothing
+    and, more annoyingly, every static analyser flags `os.system` as a command
+    injection risk no matter what it is passed - the NerdQAxe sibling of this
+    script was reported as CWE-78 even though the argument is a constant empty
+    string evaluated before any user input is parsed. Setting the console mode
+    directly is what the shell spawn was indirectly causing anyway: no
+    subprocess, no finding to triage.
+
+    Silent no-op if there is no console to configure, which is the normal case
+    when stdout is redirected to a file or a pipe.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        STD_OUTPUT_HANDLE = -11
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        mode = ctypes.c_ulong()
+        # GetConsoleMode fails on a redirected handle; nothing to do there.
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(
+                handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            )
+    except (AttributeError, OSError):
+        # ctypes.windll is absent off Windows; the API can also refuse. Colour
+        # is cosmetic, so a failure here must never stop a benchmark run.
+        pass
+
 # Configuration
 voltage_increment = 20
 frequency_increment = 25
@@ -1670,10 +1711,9 @@ def main():
     global thermal_margin, soak_minutes, bracket_enabled, selection_prefer, extend_on_variance
     global max_vr_temp, vr_margin
 
-    # On Windows, this call turns on ANSI escape processing so the colored output
-    # renders in the classic console (Windows Terminal already supports it).
-    if os.name == "nt":
-        os.system("")
+    # Colored output needs ANSI escape processing switched on in the classic
+    # Windows console; see enable_windows_ansi(). No-op everywhere else.
+    enable_windows_ansi()
 
     args = parse_arguments()
     if not args.bitaxe_ip:
